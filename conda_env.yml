@@ -17,3 +17,4 @@ dependencies:
     - torch==1.8.1
     - transformers==4.5.1
     - wandb
+    - protobuf==3.20.3
