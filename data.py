@@ -53,6 +53,7 @@ class TransformSamplingSubTraj:
         state_std,
         reward_scale,
         action_range,
+        use_rnd=False,
     ):
         super().__init__()
         self.max_len = max_len
@@ -61,6 +62,7 @@ class TransformSamplingSubTraj:
         self.state_mean = state_mean
         self.state_std = state_std
         self.reward_scale = reward_scale
+        self.use_rnd = use_rnd
 
         # For some datasets there are actions with values 1.0/-1.0 which is problematic
         # for the SquahsedNormal distribution. The inversed tanh transformation will
@@ -95,6 +97,16 @@ class TransformSamplingSubTraj:
         if rtg.shape[0] <= tlen:
             rtg = np.concatenate([rtg, np.zeros((1, 1))])
 
+        if self.use_rnd:
+            intrinsic_rtg = discount_cumsum(traj["intrinsic_rewards"][si:], gamma=1.0)[: tlen + 1].reshape(
+                -1, 1
+            )
+            if intrinsic_rtg.shape[0] <= tlen:
+                intrinsic_rtg = np.concatenate([intrinsic_rtg, np.zeros((1, 1))])
+                
+            # scaling!?
+            rtg += 10*intrinsic_rtg
+        
         # padding and state + reward normalization
         act_len = aa.shape[0]
         if tlen != act_len:
@@ -137,11 +149,18 @@ def create_dataloader(
     state_std,
     reward_scale,
     action_range,
+    use_rnd=False,
     num_workers=24,
+    sample_policy="length",
 ):
     # total number of subt-rajectories you need to sample
     sample_size = batch_size * num_iters
-    sampling_ind = sample_trajs(trajectories, sample_size)
+    if sample_policy == "length":
+        sampling_ind = sample_trajs_l(trajectories, sample_size)
+    elif sample_policy == "return":
+        sampling_ind = sample_trajs_r(trajectories, sample_size)
+    else:
+        raise NotImplementedError
 
     transform = TransformSamplingSubTraj(
         max_len=max_len,
@@ -151,6 +170,7 @@ def create_dataloader(
         state_std=state_std,
         reward_scale=reward_scale,
         action_range=action_range,
+        use_rnd=use_rnd,
     )
 
     subset = SubTrajectory(trajectories, sampling_ind=sampling_ind, transform=transform)
@@ -168,10 +188,25 @@ def discount_cumsum(x, gamma):
     return ret
 
 
-def sample_trajs(trajectories, sample_size):
+def sample_trajs_l(trajectories, sample_size):
 
+    # sampling based on traj length:
     traj_lens = np.array([len(traj["observations"]) for traj in trajectories])
     p_sample = traj_lens / np.sum(traj_lens)
+
+    inds = np.random.choice(
+        np.arange(len(trajectories)),
+        size=sample_size,
+        replace=True,
+        p=p_sample,
+    )
+    return inds
+
+def sample_trajs_r(trajectories, sample_size):
+
+    # sampling based on returns:
+    returns = np.array([sum(traj["rewards"]) for traj in trajectories])
+    p_sample = (returns / np.sum(returns)).squeeze()
 
     inds = np.random.choice(
         np.arange(len(trajectories)),

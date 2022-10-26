@@ -22,7 +22,9 @@ def create_vec_eval_episodes_fn(
     use_mean=False,
     reward_scale=0.001,
 ):
-    def eval_episodes_fn(model):
+    def eval_episodes_fn(model, updated_rtg=None):
+        if updated_rtg != None:
+            eval_rtg = updated_rtg
         target_return = [eval_rtg * reward_scale] * vec_env.num_envs
         returns, lengths, _ = vec_evaluate_episode_rtg(
             vec_env,
@@ -63,6 +65,8 @@ def vec_evaluate_episode_rtg(
     device="cuda",
     mode="normal",
     use_mean=False,
+    rnd_pred=None,
+    rnd_trgt=None,
 ):
     assert len(target_return) == vec_env.num_envs
 
@@ -125,6 +129,7 @@ def vec_evaluate_episode_rtg(
             timesteps.to(dtype=torch.long),
             num_envs=num_envs,
         )
+        
         state_pred = state_pred.detach().cpu().numpy().reshape(num_envs, -1)
         reward_pred = reward_pred.detach().cpu().numpy().reshape(num_envs)
 
@@ -180,6 +185,18 @@ def vec_evaluate_episode_rtg(
         if not np.any(unfinished):
             break
 
+    # exploration:
+    if rnd_pred != None:
+        traj_len = states.shape[1]
+        # calculate intrinsic reward aka prediction error on the whole trajectory
+        states_ = states.reshape(num_envs*traj_len, -1)
+        predictions = rnd_pred((states_.to(dtype=torch.float32) - state_mean) / state_std)
+        targets = rnd_trgt((states_.to(dtype=torch.float32) - state_mean) / state_std)
+        predictions = predictions.reshape(num_envs, traj_len, -1)
+        targets = targets.reshape(num_envs, traj_len, -1)
+        pred_errors = ((predictions - targets)**2).mean(dim=-1, keepdim=True)
+    else:
+        pred_errors = rewards
 
     trajectories = []
     for ii in range(num_envs):
@@ -190,6 +207,7 @@ def vec_evaluate_episode_rtg(
             "observations": states[ii].detach().cpu().numpy()[:ep_len],
             "actions": actions[ii].detach().cpu().numpy()[:ep_len],
             "rewards": rewards[ii].detach().cpu().numpy()[:ep_len],
+            "intrinsic_rewards": pred_errors[ii].detach().cpu().numpy()[:ep_len],
             "terminals": terminals,
         }
         trajectories.append(traj)

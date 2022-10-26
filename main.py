@@ -12,6 +12,7 @@ import random
 import time
 import gym
 import d4rl
+from more_itertools import sample
 import torch
 import numpy as np
 import wandb
@@ -26,6 +27,7 @@ from decision_transformer.models.decision_transformer import DecisionTransformer
 from evaluation import create_vec_eval_episodes_fn, vec_evaluate_episode_rtg
 from trainer import SequenceTrainer
 from logger import WandbLogger
+from exploration.rnd.default import RndPredictor
 
 MAX_EPISODE_LEN = 1000
 
@@ -83,6 +85,19 @@ class Experiment:
             betas=[0.9, 0.999],
         )
 
+        # Exploration 
+        self.use_rnd = variant["use_rnd"]
+        if self.use_rnd:
+            self.predictor_network_rnd = RndPredictor(obs_size=self.state_dim, hidden_size=256).to(device=self.device)
+            self.target_network_rnd = RndPredictor(obs_size=self.state_dim, hidden_size=256).to(device=self.device)
+
+            self.rnd_optimizer = torch.optim.Adam(self.predictor_network_rnd.parameters(), lr=3e-4)
+        else:
+            self.predictor_network_rnd = None
+            self.target_network_rnd = None
+
+            self.rnd_optimizer = None  
+        
         # track the training progress and
         # training/evaluation/online performance in all the iterations
         self.pretrain_iter = 0
@@ -212,6 +227,8 @@ class Experiment:
                 state_std=self.state_std,
                 device=self.device,
                 use_mean=False,
+                rnd_pred=self.predictor_network_rnd,
+                rnd_trgt=self.target_network_rnd,
             )
 
         self.replay_buffer.add_new_trajs(trajs)
@@ -247,6 +264,10 @@ class Experiment:
             log_temperature_optimizer=self.log_temperature_optimizer,
             scheduler=self.scheduler,
             device=self.device,
+            use_rnd=False,
+            rnd_pred=self.predictor_network_rnd,
+            rnd_trg=self.predictor_network_rnd,
+            rnd_opti=self.rnd_optimizer,
         )
 
         writer = wandb.init(dir=self.logger.log_path,
@@ -293,12 +314,12 @@ class Experiment:
 
             self.pretrain_iter += 1
 
-    def evaluate(self, eval_fns):
+    def evaluate(self, eval_fns, updated_r2g=None):
         eval_start = time.time()
         self.model.eval()
         outputs = {}
         for eval_fn in eval_fns:
-            o = eval_fn(self.model)
+            o = eval_fn(self.model, updated_r2g)
             outputs.update(o)
         outputs["time/evaluation"] = time.time() - eval_start
 
@@ -323,11 +344,15 @@ class Experiment:
             log_temperature_optimizer=self.log_temperature_optimizer,
             scheduler=self.scheduler,
             device=self.device,
+            use_rnd=self.use_rnd,
+            rnd_pred = self.predictor_network_rnd,
+            rnd_trg = self.target_network_rnd,
+            rnd_opti = self.rnd_optimizer,
         )
         eval_fns = [
             create_vec_eval_episodes_fn(
                 vec_env=eval_envs,
-                eval_rtg=evaluation_rtg,
+                eval_rtg=evaluation_rtg, # TODO: I tink this is fixed make if flexible. thats why the eval_reward is broken
                 state_dim=self.state_dim,
                 act_dim=self.act_dim,
                 state_mean=self.state_mean,
@@ -346,25 +371,31 @@ class Experiment:
                             group=self.variant["env"])
         
         # TODO: prefill buffer with x trajectories and set online rtg
-        print("\n*** Prefilling Replay Buffer! ***\n")
-        for i in range(self.variant["prefill_trajectories"]):
-            augment_outputs = self._augment_trajectories(online_envs=online_envs,
-                                                     target_explore=online_rtg, # TODO: experiment with online rtg starting at 1.0 and updating over time
-                                                     n=self.variant["num_online_rollouts"],
-                                                     )
-            if augment_outputs["aug_traj/max_return"] > online_rtg:
-                online_rtg = augment_outputs["aug_traj/max_return"]
+        if not self.variant["expert_experience"]:
+            print("\n*** Prefilling Replay Buffer! ***\n")
+            for i in range(self.variant["prefill_trajectories"]):
+                augment_outputs = self._augment_trajectories(online_envs=online_envs,
+                                                        target_explore=online_rtg, # TODO: experiment with online rtg starting at 1.0 and updating over time
+                                                        n=self.variant["num_online_rollouts"],
+                                                        )
+                # Update best RTG
+                if augment_outputs["aug_traj/max_return"] > online_rtg:
+                    online_rtg = augment_outputs["aug_traj/max_return"] * 2
+                    evaluation_rtg = augment_outputs["aug_traj/max_return"]
         
         while self.online_iter < self.variant["max_online_iters"] and self.total_transitions_sampled < self.variant["max_interactions"] :
 
             outputs = {}
+            # sample online_rtg?
+            mean_returns, return_std = np.random.uniform(self.replay_buffer.traj_stats())
+            online_rtg = np.random.uniform(mean_returns, mean_returns+return_std)
             # update rtg targets
             outputs["aug_traj/online_rtg"] = online_rtg
-
+            
             # collect new trajectory 
             augment_outputs = self._augment_trajectories(
                 online_envs=online_envs,
-                target_explore=online_rtg, # TODO: experiment with online rtg starting at 1.0 and updating over time
+                target_explore=online_rtg,
                 n=self.variant["num_online_rollouts"],
             )
             outputs.update(augment_outputs)
@@ -380,6 +411,8 @@ class Experiment:
                 state_std=self.state_std,
                 reward_scale=self.reward_scale,
                 action_range=self.action_range,
+                use_rnd=self.use_rnd,
+                sample_policy=self.variant["sample_policy"],
             )
 
             # finetuning
@@ -398,7 +431,7 @@ class Experiment:
             outputs.update(train_outputs)
 
             if evaluation:
-                eval_outputs, eval_reward = self.evaluate(eval_fns)
+                eval_outputs, eval_reward = self.evaluate(eval_fns, evaluation_rtg)
                 outputs.update(eval_outputs)
                 outputs["evaluation/evaluation_rtg"] = evaluation_rtg
 
@@ -419,11 +452,12 @@ class Experiment:
 
             self.online_iter += 1
             if self.variant["online_rtg_adaptation"]:
-                if augment_outputs["aug_traj/max_return"] > online_rtg:
+                if augment_outputs["aug_traj/max_return"] >= online_rtg:
                     # TODO: maybe differentiate between collect/online and eval.
                     # collect is 2* eval 
+                    online_rtg = augment_outputs["aug_traj/max_return"] * 2
                     evaluation_rtg = augment_outputs["aug_traj/max_return"]
-                    online_rtg = augment_outputs["aug_traj/max_return"]
+                    
 
     def __call__(self):
 
@@ -531,15 +565,16 @@ if __name__ == "__main__":
     parser.add_argument("--learning_rate", "-lr", type=float, default=1e-4)
     parser.add_argument("--weight_decay", "-wd", type=float, default=5e-4)
     parser.add_argument("--warmup_steps", type=int, default=10000)
+    parser.add_argument("--sample_policy", type=str, default="length", choices=["length", "return"])
 
     # pretraining options
     parser.add_argument("--max_pretrain_iters", type=int, default=0) # original: 1
     parser.add_argument("--num_updates_per_pretrain_iter", type=int, default=5000)
 
     # finetuning options
-    parser.add_argument("--expert_experience", type=int, choices=[0,1], default=1)
+    parser.add_argument("--expert_experience", type=int, choices=[0,1], default=0)
     parser.add_argument("--prefill_trajectories", type=int, default=1000)
-    parser.add_argument("--online_rtg_adaptation", type=int, choices=[0,1], default=0)
+    parser.add_argument("--online_rtg_adaptation", type=int, choices=[0,1], default=1)
     parser.add_argument("--max_online_iters", type=int, default=1500)
     parser.add_argument("--max_interactions", type=int, default=1_000_000)
     parser.add_argument("--online_rtg", type=int, default=7200)
@@ -547,6 +582,9 @@ if __name__ == "__main__":
     parser.add_argument("--replay_size", type=int, default=1000)
     parser.add_argument("--num_updates_per_online_iter", type=int, default=300)
     parser.add_argument("--eval_interval", type=int, default=10)
+    
+    # exploratin bonus
+    parser.add_argument("--use_rnd", type=int, choices=[0,1], default=0)
 
     # environment options
     parser.add_argument("--device", type=str, default="cuda")
