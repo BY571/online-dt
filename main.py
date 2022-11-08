@@ -85,6 +85,7 @@ class Experiment:
             betas=[0.9, 0.999],
         )
 
+        self.best_x_buffer = variant["best_x"]
         # Exploration 
         self.use_rnd = variant["use_rnd"]
         if self.use_rnd:
@@ -209,37 +210,57 @@ class Experiment:
     ):
 
         max_ep_len = MAX_EPISODE_LEN
-
+        returns = 0.0
+        lengths = 0
+        mean_returns = 0.1
+        mean_traj_lens = 1
+        max_iter = 5
+        iter = 0
         with torch.no_grad():
             # generate init state
             target_return = [target_explore * self.reward_scale] * online_envs.num_envs
-
-            returns, lengths, trajs = vec_evaluate_episode_rtg(
-                online_envs,
-                self.state_dim,
-                self.act_dim,
-                self.model,
-                max_ep_len=max_ep_len,
-                reward_scale=self.reward_scale,
-                target_return=target_return,
-                mode="normal",
-                state_mean=self.state_mean,
-                state_std=self.state_std,
-                device=self.device,
-                use_mean=False,
-                rnd_pred=self.predictor_network_rnd,
-                rnd_trgt=self.target_network_rnd,
-            )
-
-        self.replay_buffer.add_new_trajs(trajs)
-        self.aug_trajs += trajs
-        self.total_transitions_sampled += np.sum(lengths)
-
-        return {
-            "aug_traj/return": np.mean(returns),
-            "aug_traj/max_return": np.max(returns),
-            "aug_traj/length": np.mean(lengths),
-            "aug_traj/buffer_len": self.replay_buffer.__len__()}
+            if not self.prefill:
+                mean_returns, _, mean_traj_lens = self.replay_buffer.traj_stats(best_x=self.best_x_buffer)
+            #while returns < mean_returns:
+            while lengths < mean_traj_lens:
+                returns, lengths, trajs = vec_evaluate_episode_rtg(
+                    online_envs,
+                    self.state_dim,
+                    self.act_dim,
+                    self.model,
+                    max_ep_len=max_ep_len,
+                    reward_scale=self.reward_scale,
+                    target_return=target_return,
+                    mode="normal",
+                    state_mean=self.state_mean,
+                    state_std=self.state_std,
+                    device=self.device,
+                    use_mean=False,
+                    rnd_pred=self.predictor_network_rnd,
+                    rnd_trgt=self.target_network_rnd,
+                )
+                output = {
+                    "aug_traj/return": np.mean(returns),
+                    "aug_traj/max_return": np.max(returns),
+                    "aug_traj/length": np.mean(lengths),
+                    "aug_traj/buffer_len": self.replay_buffer.__len__()}
+                # only add trajectories when they 
+                if not self.prefill:
+                    # if returns > mean_returns:
+                    if lengths > mean_traj_lens:
+                        self.replay_buffer.add_new_trajs(trajs)
+                        self.aug_trajs += trajs
+                        self.total_transitions_sampled += np.sum(lengths)
+                        output.update({"buffer_mean_return": mean_returns, "buffer_mean_traj_length": mean_traj_lens})
+                else:
+                    self.replay_buffer.add_new_trajs(trajs)
+                    self.aug_trajs += trajs
+                    self.total_transitions_sampled += np.sum(lengths)
+                iter += 1
+                if iter >= max_iter:
+                    break
+        output.update({"aug_traj/collection_rollout_iter": iter})
+        return output
 
     def pretrain(self, eval_envs, loss_fn):
         print("\n\n\n*** Pretrain ***")
@@ -374,6 +395,7 @@ class Experiment:
         if not self.variant["expert_experience"]:
             print("\n*** Prefilling Replay Buffer! ***\n")
             for i in range(self.variant["prefill_trajectories"]):
+                self.prefill = True
                 augment_outputs = self._augment_trajectories(online_envs=online_envs,
                                                         target_explore=online_rtg, # TODO: experiment with online rtg starting at 1.0 and updating over time
                                                         n=self.variant["num_online_rollouts"],
@@ -382,13 +404,13 @@ class Experiment:
                 if augment_outputs["aug_traj/max_return"] > online_rtg:
                     online_rtg = augment_outputs["aug_traj/max_return"] * 2
                     evaluation_rtg = augment_outputs["aug_traj/max_return"]
-        
+        self.prefill = False
         while self.online_iter < self.variant["max_online_iters"] and self.total_transitions_sampled < self.variant["max_interactions"] :
 
             outputs = {}
             # sample online_rtg?
-            mean_returns, return_std = np.random.uniform(self.replay_buffer.traj_stats())
-            online_rtg = np.random.uniform(mean_returns, mean_returns+return_std)
+            # mean_returns, return_std = np.random.uniform(self.replay_buffer.traj_stats())
+             #online_rtg = np.random.uniform(mean_returns, mean_returns+return_std)
             # update rtg targets
             outputs["aug_traj/online_rtg"] = online_rtg
             
@@ -572,17 +594,19 @@ if __name__ == "__main__":
     parser.add_argument("--num_updates_per_pretrain_iter", type=int, default=5000)
 
     # finetuning options
-    parser.add_argument("--expert_experience", type=int, choices=[0,1], default=0)
-    parser.add_argument("--prefill_trajectories", type=int, default=1000)
-    parser.add_argument("--online_rtg_adaptation", type=int, choices=[0,1], default=1)
-    parser.add_argument("--max_online_iters", type=int, default=1500)
+    parser.add_argument("--expert_experience", type=int, choices=[0,1], default=1)
+    parser.add_argument("--prefill_trajectories", type=int, default=1)
+    parser.add_argument("--online_rtg_adaptation", type=int, choices=[0,1], default=0)
+    parser.add_argument("--max_online_iters", type=int, default=7000) # 1500
     parser.add_argument("--max_interactions", type=int, default=1_000_000)
     parser.add_argument("--online_rtg", type=int, default=7200)
     parser.add_argument("--num_online_rollouts", type=int, default=1) # TODO: not used yet! always 1
     parser.add_argument("--replay_size", type=int, default=1000)
-    parser.add_argument("--num_updates_per_online_iter", type=int, default=300)
+    parser.add_argument("--num_updates_per_online_iter", type=int, default=50) # 300
     parser.add_argument("--eval_interval", type=int, default=10)
     
+    # add to buffer when aug_return is bigger than x best mean returns
+    parser.add_argument("--best_x", type=int, default=1000)
     # exploratin bonus
     parser.add_argument("--use_rnd", type=int, choices=[0,1], default=0)
 

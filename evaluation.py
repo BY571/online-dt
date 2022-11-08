@@ -24,8 +24,9 @@ def create_vec_eval_episodes_fn(
 ):
     def eval_episodes_fn(model, updated_rtg=None):
         if updated_rtg != None:
-            eval_rtg = updated_rtg
-        target_return = [eval_rtg * reward_scale] * vec_env.num_envs
+            target_return = [updated_rtg * reward_scale] * vec_env.num_envs
+        else:
+            target_return = [eval_rtg * reward_scale] * vec_env.num_envs
         returns, lengths, _ = vec_evaluate_episode_rtg(
             vec_env,
             state_dim,

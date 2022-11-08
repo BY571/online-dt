@@ -215,7 +215,7 @@ class DecisionTransformer(TrajectoryModel):
         # embed each modality with a different head
         state_embeddings = self.embed_state(states)
         action_embeddings = self.embed_action(actions)
-        returns_embeddings = self.embed_return(returns_to_go)
+        # returns_embeddings = self.embed_return(returns_to_go)
 
         if self.ordering:
             order_embeddings = self.embed_ordering(timesteps)
@@ -224,24 +224,24 @@ class DecisionTransformer(TrajectoryModel):
 
         state_embeddings = state_embeddings + order_embeddings
         action_embeddings = action_embeddings + order_embeddings
-        returns_embeddings = returns_embeddings + order_embeddings
+        # returns_embeddings = returns_embeddings + order_embeddings
 
         # this makes the sequence look like (R_1, s_1, a_1, R_2, s_2, a_2, ...)
         # which works nice in an autoregressive sense since states predict actions
         stacked_inputs = (
             torch.stack(
-                (returns_embeddings, state_embeddings, action_embeddings), dim=1
+                (state_embeddings, action_embeddings), dim=1 # returns_embeddings
             )
             .permute(0, 2, 1, 3)
-            .reshape(batch_size, 3 * seq_length, self.hidden_size)
+            .reshape(batch_size, 2 * seq_length, self.hidden_size) # with RTG 3
         )
         stacked_inputs = self.embed_ln(stacked_inputs)
 
         # to make the attention mask fit the stacked inputs, have to stack it as well
         stacked_padding_mask = (
-            torch.stack((padding_mask, padding_mask, padding_mask), dim=1)
+            torch.stack((padding_mask, padding_mask), dim=1) # padding_mask
             .permute(0, 2, 1)
-            .reshape(batch_size, 3 * seq_length)
+            .reshape(batch_size, 2 * seq_length)  # with RTG 3
         )
 
         # we feed in the input embeddings (not word indices as in NLP) to the model
@@ -253,15 +253,15 @@ class DecisionTransformer(TrajectoryModel):
 
         # reshape x so that the second dimension corresponds to the original
         # returns (0), states (1), or actions (2); i.e. x[:,1,t] is the token for s_t
-        x = x.reshape(batch_size, seq_length, 3, self.hidden_size).permute(0, 2, 1, 3)
+        x = x.reshape(batch_size, seq_length, 2, self.hidden_size).permute(0, 2, 1, 3) # with RTG 3
 
         # get predictions
         # predict next return given state and action
-        return_preds = self.predict_return(x[:, 2])
+        return_preds = self.predict_return(x[:, 1])
         # predict next state given state and action
-        state_preds = self.predict_state(x[:, 2])
+        state_preds = self.predict_state(x[:, 1])
         # predict next action given state
-        action_preds = self.predict_action(x[:, 1])
+        action_preds = self.predict_action(x[:, 0])
 
         return state_preds, action_preds, return_preds
 

@@ -27,8 +27,9 @@ class ReplayBuffer(object):
     
     def traj_stats(self, best_x=10):
         returns = np.array([sum(traj["rewards"]) for traj in self.trajectories])
+        lengths = np.array([len(traj["rewards"]) for traj in self.trajectories])
         best_returns = np.sort(returns).squeeze()[-best_x:]  # lowest to highest
-        return np.mean(best_returns), np.std(best_returns)
+        return np.mean(best_returns), np.std(best_returns), np.mean(lengths)
 
     def add_new_trajs(self, new_trajs):
         if len(self.trajectories) < self.capacity:
