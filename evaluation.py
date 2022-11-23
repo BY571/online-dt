@@ -330,7 +330,8 @@ def video_evaluate_episode_rtg(
                 action = action + noise
 
         action = action.clamp(*model.action_range)
-
+        env.render(mode="human")# mode="human", width=256, height=256) #mode="rgb_array")
+        #print(t)
         state, reward, done, _ = env.step(action.detach().cpu().numpy())
 
         # eval_env.step() will execute the action for all the sub-envs, for those where
