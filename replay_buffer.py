@@ -9,8 +9,9 @@ import numpy as np
 
 
 class ReplayBuffer(object):
-    def __init__(self, capacity, trajectories=[]):
+    def __init__(self, capacity, adding_type="ffo", trajectories=[]):
         self.capacity = capacity
+        self.adding_type = adding_type
         if len(trajectories) <= self.capacity:
             self.trajectories = trajectories
         else:
@@ -25,20 +26,52 @@ class ReplayBuffer(object):
     def __len__(self):
         return len(self.trajectories)
     
-    def traj_stats(self, best_x=10):
+    def best_traj_stats(self, best_x=10):
         returns = np.array([sum(traj["rewards"]) for traj in self.trajectories])
         lengths = np.array([len(traj["rewards"]) for traj in self.trajectories])
         best_returns = np.sort(returns).squeeze()[-best_x:]  # lowest to highest
-        return np.mean(best_returns), np.std(best_returns), np.mean(lengths)
+        best_lengths = np.sort(lengths).squeeze()[-best_x:]  # lowest to highest
+        return np.mean(best_returns), np.std(best_returns), np.mean(best_lengths), np.min(returns)
+    
+    def buffer_stats(self, ):
+        returns = np.array([sum(traj["rewards"]) for traj in self.trajectories])
+        lengths = np.array([len(traj["rewards"]) for traj in self.trajectories])
+        max_return, min_return, mean_return = np.max(returns), np.min(returns), np.mean(returns)
+        max_traj_lenghts, min_traj_length, mean_traj_length = np.max(lengths), np.min(lengths), np.mean(lengths)
+        output = {"buffer/max_return": max_return,
+                  "buffer/min_return": min_return,
+                  "buffer/mean_return": mean_return,
+                  "buffer/max_traj_len": max_traj_lenghts,
+                  "buffer/min_traj_len": min_traj_length,
+                  "buffer/mean_traj_len": mean_traj_length}
+        return output
 
     def add_new_trajs(self, new_trajs):
         if len(self.trajectories) < self.capacity:
             self.trajectories.extend(new_trajs)
             self.trajectories = self.trajectories[-self.capacity :]
         else:
-            self.trajectories[
-                self.start_idx : self.start_idx + len(new_trajs)
-            ] = new_trajs
-            self.start_idx = (self.start_idx + len(new_trajs)) % self.capacity
+            if self.adding_type == "ffo":
+                self.trajectories[
+                    self.start_idx : self.start_idx + len(new_trajs)
+                ] = new_trajs
+                self.start_idx = (self.start_idx + len(new_trajs)) % self.capacity
+            elif self.adding_type == "return":
+                returns = np.array([sum(traj["rewards"]) for traj in self.trajectories])
+                return_idxs = np.argsort(returns.squeeze())  # lowest to highest
+                num_new_traj = len(new_trajs)
+                traj_2_replace = return_idxs[:num_new_traj]
+                for (idx, new_traj) in zip(traj_2_replace, new_trajs):
+                    self.trajectories[idx] = new_traj
+                
+            elif self.adding_type == "traj_len":
+                lengths = np.array([len(traj["rewards"]) for traj in self.trajectories])
+                lengths_idxs = np.argsort(lengths).squeeze()  # lowest to highest
+                num_new_traj = len(new_trajs)
+                traj_2_replace = lengths_idxs[:num_new_traj]
+                for (idx, new_traj) in zip(traj_2_replace, new_trajs):
+                    self.trajectories[idx] = new_traj
+            else:
+                raise NotImplementedError
 
         assert len(self.trajectories) <= self.capacity

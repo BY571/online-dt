@@ -41,9 +41,9 @@ class Experiment:
         )
         # initialize by offline trajs
         if variant["expert_experience"]:
-            self.replay_buffer = ReplayBuffer(variant["replay_size"], self.offline_trajs)
+            self.replay_buffer = ReplayBuffer(variant["replay_size"], adding_type=variant["buffer_adding"], trajectories=self.offline_trajs)
         else:
-            self.replay_buffer = ReplayBuffer(variant["replay_size"], [])
+            self.replay_buffer = ReplayBuffer(variant["replay_size"], adding_type=variant["buffer_adding"], trajectories=[])
         self.aug_trajs = []
 
         self.device = variant.get("device", "cuda")
@@ -63,12 +63,14 @@ class Experiment:
             n_positions=1024,
             resid_pdrop=variant["dropout"],
             attn_pdrop=variant["dropout"],
-            stochastic_policy=True,
+            stochastic_policy=variant["stochastic_policy"],
             ordering=variant["ordering"],
             init_temperature=variant["init_temperature"],
             target_entropy=self.target_entropy,
         ).to(device=self.device)
 
+        self.stochastic_policy = variant["stochastic_policy"]
+        
         self.optimizer = Lamb(
             self.model.parameters(),
             lr=variant["learning_rate"],
@@ -220,13 +222,14 @@ class Experiment:
             # generate init state
             target_return = [target_explore * self.reward_scale] * online_envs.num_envs
             if not self.prefill:
-                mean_returns, _, mean_traj_lens = self.replay_buffer.traj_stats(best_x=self.best_x_buffer)
-            #while returns < mean_returns:
-            while lengths < mean_traj_lens:
+                mean_returns, _, mean_traj_lens, min_return = self.replay_buffer.best_traj_stats(best_x=self.best_x_buffer)
+            while returns < mean_returns:
+            #while lengths < mean_traj_lens:
                 returns, lengths, trajs = vec_evaluate_episode_rtg(
                     online_envs,
                     self.state_dim,
                     self.act_dim,
+                    self.action_range,
                     self.model,
                     max_ep_len=max_ep_len,
                     reward_scale=self.reward_scale,
@@ -235,6 +238,7 @@ class Experiment:
                     state_mean=self.state_mean,
                     state_std=self.state_std,
                     device=self.device,
+                    stochastic_policy=self.stochastic_policy,
                     use_mean=False,
                     rnd_pred=self.predictor_network_rnd,
                     rnd_trgt=self.target_network_rnd,
@@ -246,9 +250,18 @@ class Experiment:
                     "aug_traj/buffer_len": self.replay_buffer.__len__()}
                 # only add trajectories when they 
                 if not self.prefill:
-                    # if returns > mean_returns:
-                    if lengths > mean_traj_lens:
+                    if returns > mean_returns:
+                    #if lengths > mean_traj_lens:
                         self.replay_buffer.add_new_trajs(trajs)
+                        self.aug_trajs += trajs
+                        self.total_transitions_sampled += np.sum(lengths)
+                        output.update({"buffer_mean_return": mean_returns, "buffer_mean_traj_length": mean_traj_lens})
+                    elif returns > min_return:
+                        self.replay_buffer.add_new_trajs(trajs)
+                        self.aug_trajs += trajs
+                        self.total_transitions_sampled += np.sum(lengths)
+                        output.update({"buffer_mean_return": mean_returns, "buffer_mean_traj_length": mean_traj_lens})
+                    else:
                         self.aug_trajs += trajs
                         self.total_transitions_sampled += np.sum(lengths)
                         output.update({"buffer_mean_return": mean_returns, "buffer_mean_traj_length": mean_traj_lens})
@@ -271,10 +284,13 @@ class Experiment:
                 eval_rtg=self.variant["eval_rtg"],
                 state_dim=self.state_dim,
                 act_dim=self.act_dim,
+                action_range=self.action_range,
                 state_mean=self.state_mean,
                 state_std=self.state_std,
                 device=self.device,
+                stochastic_policy=self.stochastic_policy,
                 use_mean=True,
+                exploration_noise=0.1,
                 reward_scale=self.reward_scale,
             )
         ]
@@ -376,10 +392,13 @@ class Experiment:
                 eval_rtg=evaluation_rtg, # TODO: I tink this is fixed make if flexible. thats why the eval_reward is broken
                 state_dim=self.state_dim,
                 act_dim=self.act_dim,
+                action_range=self.action_range,
                 state_mean=self.state_mean,
                 state_std=self.state_std,
                 device=self.device,
+                stochastic_policy=self.stochastic_policy,
                 use_mean=True,
+                exploration_noise=0.1,
                 reward_scale=self.reward_scale,
             )
         ]
@@ -451,6 +470,7 @@ class Experiment:
                 dataloader=dataloader,
             )
             outputs.update(train_outputs)
+            outputs.update(self.replay_buffer.buffer_stats())
 
             if evaluation:
                 eval_outputs, eval_reward = self.evaluate(eval_fns, evaluation_rtg)
@@ -486,24 +506,26 @@ class Experiment:
         utils.set_seed_everywhere(args.seed)
 
         # import d4rl
+        if self.stochastic_policy:
+            def loss_fn(
+                a_hat_dist,
+                a,
+                attention_mask,
+                entropy_reg,
+            ):
+                # a_hat is a SquashedNormal Distribution
+                log_likelihood = a_hat_dist.log_likelihood(a)[attention_mask > 0].mean()
 
-        def loss_fn(
-            a_hat_dist,
-            a,
-            attention_mask,
-            entropy_reg,
-        ):
-            # a_hat is a SquashedNormal Distribution
-            log_likelihood = a_hat_dist.log_likelihood(a)[attention_mask > 0].mean()
+                entropy = a_hat_dist.entropy().mean()
+                loss = -(log_likelihood + entropy_reg * entropy)
 
-            entropy = a_hat_dist.entropy().mean()
-            loss = -(log_likelihood + entropy_reg * entropy)
-
-            return (
-                loss,
-                -log_likelihood,
-                entropy,
-            )
+                return (
+                    loss,
+                    -log_likelihood,
+                    entropy,
+                )
+        else:
+            loss_fn = lambda a_hat, a: torch.mean((a_hat - a)**2)
 
         def get_env_builder(seed, env_name, target_goal=None):
             def make_env_fn():
@@ -574,6 +596,7 @@ if __name__ == "__main__":
     parser.add_argument("--activation_function", type=str, default="relu")
     parser.add_argument("--dropout", type=float, default=0.1)
     parser.add_argument("--eval_context_length", type=int, default=5)
+    parser.add_argument("--stochastic_policy", type=int, choices=[0,1], default=0)
     # 0: no pos embedding others: absolute ordering
     parser.add_argument("--ordering", type=int, default=0)
 
@@ -587,18 +610,18 @@ if __name__ == "__main__":
     parser.add_argument("--learning_rate", "-lr", type=float, default=1e-4)
     parser.add_argument("--weight_decay", "-wd", type=float, default=5e-4)
     parser.add_argument("--warmup_steps", type=int, default=10000)
-    parser.add_argument("--sample_policy", type=str, default="length", choices=["length", "return"])
+    parser.add_argument("--sample_policy", type=str, default="return", choices=["length", "return"])
 
     # pretraining options
     parser.add_argument("--max_pretrain_iters", type=int, default=0) # original: 1
     parser.add_argument("--num_updates_per_pretrain_iter", type=int, default=5000)
 
     # finetuning options
-    parser.add_argument("--expert_experience", type=int, choices=[0,1], default=1)
-    parser.add_argument("--prefill_trajectories", type=int, default=1)
+    parser.add_argument("--expert_experience", type=int, choices=[0,1], default=0)
+    parser.add_argument("--prefill_trajectories", type=int, default=1000)
     parser.add_argument("--online_rtg_adaptation", type=int, choices=[0,1], default=0)
-    parser.add_argument("--max_online_iters", type=int, default=7000) # 1500
-    parser.add_argument("--max_interactions", type=int, default=1_000_000)
+    parser.add_argument("--max_online_iters", type=int, default=30000) # 1500
+    parser.add_argument("--max_interactions", type=int, default=2_000_000)
     parser.add_argument("--online_rtg", type=int, default=7200)
     parser.add_argument("--num_online_rollouts", type=int, default=1) # TODO: not used yet! always 1
     parser.add_argument("--replay_size", type=int, default=1000)
@@ -606,7 +629,9 @@ if __name__ == "__main__":
     parser.add_argument("--eval_interval", type=int, default=10)
     
     # add to buffer when aug_return is bigger than x best mean returns
-    parser.add_argument("--best_x", type=int, default=1000)
+    parser.add_argument("--buffer_adding", type=str, choices=["ffo", "return", "traj_len"], default="return",
+                        help="how to add new trajectories ffo=first_in_first_out, return=exchanges worst return trajectory with new traje, traj_len= exchanges shortest trajectory with new traj")
+    parser.add_argument("--best_x", type=int, default=500)
     # exploratin bonus
     parser.add_argument("--use_rnd", type=int, choices=[0,1], default=0)
 

@@ -184,10 +184,10 @@ class DecisionTransformer(TrajectoryModel):
         self.ordering = ordering
         self.action_range = action_range
 
-        if stochastic_policy:
-            self.log_temperature = torch.tensor(np.log(init_temperature))
-            self.log_temperature.requires_grad = True
-            self.target_entropy = target_entropy
+        self.log_temperature = torch.tensor(np.log(init_temperature))
+        self.log_temperature.requires_grad = True
+        self.target_entropy = target_entropy
+
 
     def temperature(self):
         if self.stochastic_policy:
@@ -383,7 +383,7 @@ class DecisionTransformer(TrajectoryModel):
         else:
             return (
                 state_preds[:, -1],
-                self.clamp_action(action_preds[:, -1]),
+                self.clamp_action(torch.tanh(action_preds[:, -1])),
                 return_preds[:, -1],
             )
 
