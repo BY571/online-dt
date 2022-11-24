@@ -11,6 +11,8 @@ import pickle
 import random
 import time
 import gym
+from gym.wrappers.monitoring.video_recorder import VideoRecorder
+from gym.wrappers import Monitor
 import d4rl
 from more_itertools import sample
 import torch
@@ -202,7 +204,7 @@ class Experiment:
             print(f"Generated the fixed target goal: {target_goal}")
         else:
             target_goal = None
-        from gym.wrappers import Monitor
+
         env = gym.make(env_name)
         env = Monitor(env, './dt-eval/video',video_callable=lambda episode_id: True, force=True)
         self.start_time = time.time()
@@ -213,7 +215,7 @@ class Experiment:
                         notes="video_evaluation",
                         group=self.variant["env"],
                         monitor_gym=True):
-            wandb.gym.monitor()
+
             video_evaluate_episode_rtg(env,
                                        state_dim=self.state_dim,
                                        act_dim=self.act_dim,
@@ -253,10 +255,10 @@ if __name__ == "__main__":
     # 0: no pos embedding others: absolute ordering
     parser.add_argument("--ordering", type=int, default=0)
 
-    parser.add_argument("--model_path", type=str, default="/shared/sebastian/online-dt/exp/2022.11.11/112439-ODT_nopretrain_noexpertbuffer_onlinefinetuning_nortg_mean500trajlen_collectiter5_50upsperstep_10kupstotal")
+    parser.add_argument("--model_path", type=str, default="saved_model")
 
     # environment options
-    parser.add_argument("--device", type=str, default="cuda")
+    parser.add_argument("--device", type=str, default="cpu")
     parser.add_argument("--exp_name", type=str, default="default")
 
     args = parser.parse_args()
