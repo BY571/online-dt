@@ -42,8 +42,6 @@ This will produce the `exp` folder, where all the outputs are going to be logged
 tensorboard --logdir exp
 ```
 
-# Visualize: export LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libGLEW.so:/usr/lib/nvidia-415/libGL.so'
-
 ## License
 The majority of `online-dt` is licensed under CC-BY-NC, however portions of the project are available under separate license terms: 
 * D4RL dataset -  Creative Commons Attribution 4.0 License (CC-BY)
