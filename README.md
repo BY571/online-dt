@@ -27,7 +27,10 @@ I have also found that `tensorboard` wants `protobuf` version to be `3.20.x`, an
 # you might need to uninstall dm-control
 pip3 install --upgrade protobuf==3.20.0 
 ```
-
+If you encounter problems with running enjoy.py and loading glfw the following command might help:
+```console
+export LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libGLEW.so:/usr/lib/nvidia-415/libGL.so
+```
 
 ## Example
 To train an ODT agent for `hopper` with the `medium-v2` dataset:
