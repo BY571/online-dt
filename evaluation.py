@@ -74,15 +74,14 @@ def vec_evaluate_episode_rtg(
     mode="normal",
     stochastic_policy=True,
     use_mean=False,
-    exploration_noise=1.0,
-    rnd_pred=None,
-    rnd_trgt=None,
+    exploration_noise=0.1,
 ):
     assert len(target_return) == vec_env.num_envs
 
     model.eval()
     model.to(device=device)
 
+    # TODO: take those off for symlog
     state_mean = torch.from_numpy(state_mean).to(device=device)
     state_std = torch.from_numpy(state_std).to(device=device)
 
@@ -133,6 +132,8 @@ def vec_evaluate_episode_rtg(
 
         state_pred, action_dist, reward_pred = model.get_predictions(
             (states.to(dtype=torch.float32) - state_mean) / state_std,
+            # symlog
+            # torch.sign(states.to(dtype=torch.float32))*torch.log(torch.abs(states.to(dtype=torch.float32)) + 1),
             actions.to(dtype=torch.float32),
             rewards.to(dtype=torch.float32),
             target_return.to(dtype=torch.float32),
@@ -145,8 +146,18 @@ def vec_evaluate_episode_rtg(
         if stochastic_policy:
             # the return action is a SquashNormal distribution
             action = action_dist.sample().reshape(num_envs, -1, act_dim)[:, -1]
+            noise = torch.normal(mean=torch.zeros_like(action), std=torch.ones_like(action) * action_range[1] * exploration_noise).to(action.device)
+            action = action + noise
+            # added state sampling
+            #state_pred = state_pred.sample().reshape(num_envs, -1, state_dim)[:, -1]
+            #
             if use_mean:
                 action = action_dist.mean.reshape(num_envs, -1, act_dim)[:, -1]
+                # TODO: solve this reshape issue
+                # state_pred = state_pred.mean.reshape(num_envs, -1, state_dim)[:, -1]
+                #state_pred = state_pred.sample().reshape(num_envs, -1, state_dim)[:, -1]
+                
+            
         else:
             action = action_dist.reshape(num_envs, -1, act_dim)[:, -1]
             if not use_mean:
@@ -201,19 +212,6 @@ def vec_evaluate_episode_rtg(
         if not np.any(unfinished):
             break
 
-    # exploration:
-    if rnd_pred != None:
-        traj_len = states.shape[1]
-        # calculate intrinsic reward aka prediction error on the whole trajectory
-        states_ = states.reshape(num_envs*traj_len, -1)
-        predictions = rnd_pred((states_.to(dtype=torch.float32) - state_mean) / state_std)
-        targets = rnd_trgt((states_.to(dtype=torch.float32) - state_mean) / state_std)
-        predictions = predictions.reshape(num_envs, traj_len, -1)
-        targets = targets.reshape(num_envs, traj_len, -1)
-        pred_errors = ((predictions - targets)**2).mean(dim=-1, keepdim=True)
-    else:
-        pred_errors = rewards
-
     trajectories = []
     for ii in range(num_envs):
         ep_len = episode_length[ii].astype(int)
@@ -223,7 +221,6 @@ def vec_evaluate_episode_rtg(
             "observations": states[ii].detach().cpu().numpy()[:ep_len],
             "actions": actions[ii].detach().cpu().numpy()[:ep_len],
             "rewards": rewards[ii].detach().cpu().numpy()[:ep_len],
-            "intrinsic_rewards": pred_errors[ii].detach().cpu().numpy()[:ep_len],
             "terminals": terminals,
         }
         trajectories.append(traj)
@@ -234,7 +231,72 @@ def vec_evaluate_episode_rtg(
         trajectories,
     )
 
+def random_collect(vec_env,
+                   state_dim,
+                   act_dim,
+                   max_ep_len=1000):
+    num_envs = vec_env.num_envs
+    state = vec_env.reset()
 
+    states = (state.reshape(num_envs, state_dim)).reshape(num_envs, -1, state_dim)
+    actions = np.zeros((num_envs, act_dim)).reshape(num_envs, -1, act_dim)
+    rewards = np.zeros((num_envs, 1)).reshape(num_envs, -1, 1)
+    
+    # episode_return, episode_length = 0.0, 0
+    episode_return = np.zeros((num_envs, 1)).astype(float)
+    episode_length = np.full(num_envs, np.inf)
+
+    unfinished = np.ones(num_envs).astype(bool)
+    for t in range(max_ep_len):
+        # add padding
+        actions = np.concatenate([actions,
+                                  np.zeros((num_envs, act_dim)).reshape(num_envs, -1, act_dim),
+                                  ],axis=1,)
+        rewards = np.concatenate([rewards,
+                                  np.zeros((num_envs, 1)).reshape(num_envs, -1, 1),
+                                  ],
+                                  axis=1,)
+        action = vec_env.action_space.sample()
+        state, reward, done, _ = vec_env.step(action)
+        episode_return[unfinished] += reward[unfinished].reshape(-1, 1)
+        actions[:, -1] = action
+        state = state.reshape(num_envs, -1, state_dim)
+        states = np.concatenate([states, state], axis=1)
+        reward = np.array(reward).reshape(num_envs, 1)
+        rewards[:, -1] = reward
+ 
+        
+        
+        if t == max_ep_len - 1:
+            done = np.ones(done.shape).astype(bool)
+
+        if np.any(done):
+            ind = np.where(done)[0]
+            unfinished[ind] = False
+            episode_length[ind] = np.minimum(episode_length[ind], t + 1)
+
+        if not np.any(unfinished):
+            break
+    trajectories = []
+
+    for ii in range(num_envs):
+        ep_len = episode_length[ii].astype(int)
+        terminals = np.zeros(ep_len)
+        terminals[-1] = 1
+        traj = {
+            "observations": states[ii][:ep_len],
+            "actions": actions[ii][:ep_len],
+            "rewards": rewards[ii][:ep_len],
+            "terminals": terminals,
+        }
+        trajectories.append(traj)
+
+    return (
+        episode_return.reshape(num_envs),
+        episode_length.reshape(num_envs),
+        trajectories,
+    )
+        
 @torch.no_grad()
 def video_evaluate_episode_rtg(
     env,
@@ -252,13 +314,13 @@ def video_evaluate_episode_rtg(
     stochastic_policy=True,
     use_mean=False,
     exploration_noise=1.0,
-    rnd_pred=None,
-    rnd_trgt=None,
+    noise_window=5,
 ):
 
     model.eval()
     model.to(device=device)
 
+    # Take those off for symlog
     state_mean = torch.from_numpy(state_mean).to(device=device)
     state_std = torch.from_numpy(state_std).to(device=device)
 
@@ -308,7 +370,7 @@ def video_evaluate_episode_rtg(
         )
 
         state_pred, action_dist, reward_pred = model.get_predictions(
-            (states.to(dtype=torch.float32) - state_mean) / state_std,
+            (states.to(dtype=torch.float32) - state_mean) / state_std, # symlog?
             actions.to(dtype=torch.float32),
             rewards.to(dtype=torch.float32),
             target_return.to(dtype=torch.float32),
@@ -326,7 +388,8 @@ def video_evaluate_episode_rtg(
         else:
             action = action_dist.reshape(num_envs, -1, act_dim)[:, -1]
             if not use_mean:
-                noise = torch.normal(mean=torch.zeros_like(action), std=torch.ones_like(action) * action_range[1] * exploration_noise).to(action.device)
+                if t % noise_window == 0:
+                    noise = torch.normal(mean=torch.zeros_like(action), std=torch.ones_like(action) * action_range[1] * exploration_noise).to(action.device)
                 action = action + noise
 
         action = action.clamp(*model.action_range)
