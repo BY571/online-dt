@@ -124,6 +124,36 @@ class DiagGaussianActor(nn.Module):
         return SquashedNormal(mu, std)
 
 
+class DiagGaussianPred(nn.Module):
+    """torch.distributions implementation of an diagonal Gaussian policy."""
+
+    def __init__(self, hidden_dim, act_dim, log_std_bounds=[-5.0, 2.0]):
+        super().__init__()
+
+        self.mu = torch.nn.Linear(hidden_dim, act_dim)
+        self.log_std = torch.nn.Linear(hidden_dim, act_dim)
+        self.log_std_bounds = log_std_bounds
+
+        def weight_init(m):
+            """Custom weight init for Conv2D and Linear layers."""
+            if isinstance(m, torch.nn.Linear):
+                nn.init.orthogonal_(m.weight.data)
+                if hasattr(m.bias, "data"):
+                    m.bias.data.fill_(0.0)
+
+        self.apply(weight_init)
+
+    def forward(self, obs):
+        mu, log_std = self.mu(obs), self.log_std(obs)
+        log_std = torch.tanh(log_std)
+        # log_std is the output of tanh so it will be between [-1, 1]
+        # map it to be between [log_std_min, log_std_max]
+        log_std_min, log_std_max = self.log_std_bounds
+        log_std = log_std_min + 0.5 * (log_std_max - log_std_min) * (log_std + 1.0)
+        std = log_std.exp()
+        return torch.distributions.Normal(mu, std)
+
+
 class DecisionTransformer(TrajectoryModel):
 
     """
@@ -137,6 +167,7 @@ class DecisionTransformer(TrajectoryModel):
         hidden_size,
         action_range,
         ordering=0,
+        use_rtg=False,
         max_length=None,
         eval_context_length=None,
         max_ep_len=4096,
@@ -169,6 +200,8 @@ class DecisionTransformer(TrajectoryModel):
         self.embed_ln = nn.LayerNorm(hidden_size)
 
         self.predict_state = torch.nn.Linear(hidden_size, self.state_dim)
+        # self.predict_state = DiagGaussianPred(hidden_size, self.state_dim)
+        
         self.predict_return = torch.nn.Linear(hidden_size, 1)
         if stochastic_policy:
             self.predict_action = DiagGaussianActor(hidden_size, self.act_dim)
@@ -187,6 +220,11 @@ class DecisionTransformer(TrajectoryModel):
         self.log_temperature = torch.tensor(np.log(init_temperature))
         self.log_temperature.requires_grad = True
         self.target_entropy = target_entropy
+        
+        if use_rtg:
+            self.forward = self.forward_rtg
+        else:
+            self.forward = self.forward_nortg
 
 
     def temperature(self):
@@ -195,7 +233,7 @@ class DecisionTransformer(TrajectoryModel):
         else:
             return None
 
-    def forward(
+    def forward_nortg(
         self,
         states,
         actions,
@@ -264,6 +302,78 @@ class DecisionTransformer(TrajectoryModel):
         action_preds = self.predict_action(x[:, 0])
 
         return state_preds, action_preds, return_preds
+
+
+    def forward_rtg(
+        self,
+        states,
+        actions,
+        rewards,
+        returns_to_go,
+        timesteps,
+        ordering,
+        padding_mask=None,
+    ):
+
+        batch_size, seq_length = states.shape[0], states.shape[1]
+
+        if padding_mask is None:
+            # attention mask for GPT: 1 if can be attended to, 0 if not
+            padding_mask = torch.ones((batch_size, seq_length), dtype=torch.long)
+
+        # embed each modality with a different head
+        state_embeddings = self.embed_state(states)
+        action_embeddings = self.embed_action(actions)
+        returns_embeddings = self.embed_return(returns_to_go)
+
+        if self.ordering:
+            order_embeddings = self.embed_ordering(timesteps)
+        else:
+            order_embeddings = 0.0
+
+        state_embeddings = state_embeddings + order_embeddings
+        action_embeddings = action_embeddings + order_embeddings
+        returns_embeddings = returns_embeddings + order_embeddings
+
+        # this makes the sequence look like (R_1, s_1, a_1, R_2, s_2, a_2, ...)
+        # which works nice in an autoregressive sense since states predict actions
+        stacked_inputs = (
+            torch.stack(
+                (returns_embeddings, state_embeddings, action_embeddings), dim=1 # returns_embeddings
+            )
+            .permute(0, 2, 1, 3)
+            .reshape(batch_size, 3 * seq_length, self.hidden_size) # with RTG 3
+        )
+        stacked_inputs = self.embed_ln(stacked_inputs)
+
+        # to make the attention mask fit the stacked inputs, have to stack it as well
+        stacked_padding_mask = (
+            torch.stack((padding_mask, padding_mask, padding_mask), dim=1) # padding_mask
+            .permute(0, 2, 1)
+            .reshape(batch_size, 3 * seq_length)  # with RTG 3
+        )
+
+        # we feed in the input embeddings (not word indices as in NLP) to the model
+        transformer_outputs = self.transformer(
+            inputs_embeds=stacked_inputs,
+            attention_mask=stacked_padding_mask,
+        )
+        x = transformer_outputs["last_hidden_state"]
+
+        # reshape x so that the second dimension corresponds to the original
+        # returns (0), states (1), or actions (2); i.e. x[:,1,t] is the token for s_t
+        x = x.reshape(batch_size, seq_length, 3, self.hidden_size).permute(0, 2, 1, 3) # with RTG 3
+
+        # get predictions
+        # predict next return given state and action
+        return_preds = self.predict_return(x[:, 1])
+        # predict next state given state and action
+        state_preds = self.predict_state(x[:, 1])
+        # predict next action given state
+        action_preds = self.predict_action(x[:, 0])
+
+        return state_preds, action_preds, return_preds
+
 
     def get_predictions(
         self, states, actions, rewards, returns_to_go, timesteps, num_envs=1, **kwargs
@@ -379,7 +489,7 @@ class DecisionTransformer(TrajectoryModel):
             **kwargs
         )
         if self.stochastic_policy:
-            return state_preds[:, -1], action_preds, return_preds[:, -1]
+            return state_preds[:, -1], action_preds, return_preds[:, -1] # state_preds[:, -1]
         else:
             return (
                 state_preds[:, -1],

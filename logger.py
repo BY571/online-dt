@@ -8,7 +8,7 @@ LICENSE.md file in the root directory of this source tree.
 from datetime import datetime
 import os
 import utils
-
+import wandb
 
 class Logger:
     def __init__(self, variant):
@@ -50,8 +50,11 @@ class WandbLogger:
         writer.log({"aug_traj/total_transitions_sampled":total_transitions_sampled}, step=iter_num)
         for k, v in outputs.items():
             print(f"{k}: {v}")
-            if writer:
-                writer.log({k: v}, step=iter_num)
+            if k == "buffer/p_sample":
+                outputs[k] = wandb.Histogram(outputs[k])
+
+        if writer:
+            writer.log(outputs, step=iter_num)
                 #if k == "evaluation/return_mean_gm":
                 #    writer.log({"evaluation/return_vs_samples":v,}, step=int(total_transitions_sampled))
 

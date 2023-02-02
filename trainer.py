@@ -8,7 +8,6 @@ LICENSE.md file in the root directory of this source tree.
 import numpy as np
 import torch
 import time
-from exploration.rnd.default import RndPredictor
 
 class SequenceTrainer:
     def __init__(
@@ -17,11 +16,7 @@ class SequenceTrainer:
         optimizer,
         log_temperature_optimizer,
         scheduler=None,
-        device="cuda",
-        use_rnd=False,
-        rnd_pred=None,
-        rnd_trg=None,
-        rnd_opti=None,
+        device="cuda"
     ):
         self.model = model
         self.stochastic_policy = model.stochastic_policy
@@ -29,10 +24,6 @@ class SequenceTrainer:
         self.log_temperature_optimizer = log_temperature_optimizer
         self.scheduler = scheduler
         self.device = device
-        self.use_rnd = use_rnd
-        self.rnd_pred = rnd_pred
-        self.rnd_trg = rnd_trg
-        self.rnd_opti = rnd_opti
         
         if self.stochastic_policy:
             self.train_iteration = self.stochastic_train_iteration
@@ -41,49 +32,35 @@ class SequenceTrainer:
         
         self.start_time = time.time()
     
-
-    def train_rnd(self, states):
-        bs = states.shape[0]
-        state_dim = states.shape[1]
-        states = states.reshape(bs*state_dim, -1)
-        state_pred = self.rnd_pred(states)
-        with torch.no_grad():
-            random_targets = self.rnd_trg(states)
-        state_pred = state_pred.reshape(bs, state_dim, -1)
-        random_targets = random_targets.reshape(bs, state_dim, -1)
-        pred_error = ((state_pred - random_targets)**2).mean(dim=-1, keepdim=True)
-        rnd_loss = pred_error.mean()
-        self.rnd_opti.zero_grad()
-        rnd_loss.backward()
-        self.rnd_opti.step()
-        return rnd_loss.detach().cpu().mean().item()
-
     def stochastic_train_iteration(
         self,
         loss_fn,
         dataloader,
     ):
 
-        losses, nlls, entropies, intrinsic_rewards = [], [], [], []
+        losses, nlls, entropies, state_losses, state_entropies = [], [], [], [], []
         logs = dict()
         train_start = time.time()
 
         self.model.train()
         for _, trajs in enumerate(dataloader):
-            loss, nll, entropy, intrinsic_reward = self.train_step_stochastic(loss_fn, trajs)
+            loss, nll, entropy, state_entropy, state_loss, lr = self.train_step_stochastic(loss_fn, trajs)
             losses.append(loss)
             nlls.append(nll)
             entropies.append(entropy)
-            intrinsic_rewards.append(intrinsic_reward)
+            state_losses.append(state_loss)
+            state_entropies.append(state_entropy)
+
 
         logs["time/training"] = time.time() - train_start
         logs["training/train_loss_mean"] = np.mean(losses)
         logs["training/train_loss_std"] = np.std(losses)
         logs["training/nll"] = nlls[-1]
         logs["training/entropy"] = entropies[-1]
+        logs["training/state_entropy"] = state_entropies[-1]
+        logs["training/state_loss"] = np.mean(state_losses)
         logs["training/temp_value"] = self.model.temperature().detach().cpu().item()
-        if self.use_rnd:
-            logs["training/intrinsic_reward"] = np.mean(intrinsic_rewards)
+        logs["training/current_lr"] = lr[-1]
 
         return logs
     
@@ -97,11 +74,12 @@ class SequenceTrainer:
         train_start = time.time()
 
         for _, trajs in enumerate(dataloader):
-            loss = self.train_step_deter(loss_fn, trajs)
+            loss, lr = self.train_step_deter(loss_fn, trajs)
             mse_loss.append(loss)
         logs["time/training"] = time.time() - train_start
         logs["training/train_loss_mean"] = np.mean(mse_loss)
         logs["training/train_loss_std"] = np.std(mse_loss)
+        logs["training/current_lr"] = lr[-1]
         return logs
 
     def train_step_stochastic(self, loss_fn, trajs):
@@ -125,13 +103,10 @@ class SequenceTrainer:
         ordering = ordering.to(self.device)
         padding_mask = padding_mask.to(self.device)        
         
-        if self.use_rnd:
-            rnd_loss = self.train_rnd(states)
-        else:
-            rnd_loss = 0.0
         action_target = torch.clone(actions)
+        states_target = torch.clone(states)
 
-        _, action_preds, _ = self.model.forward(
+        state_preds, action_preds, _ = self.model.forward(
             states,
             actions,
             rewards,
@@ -141,11 +116,16 @@ class SequenceTrainer:
             padding_mask=padding_mask,
         )
 
-        loss, nll, entropy = loss_fn(
+        #noise = (torch.randn_like(action_target) * 0.01).clamp(-0.05, 0.05)
+        #action_target = torch.tanh(action_target + noise.to(self.device))
+
+        loss, nll, entropy, state_entropy, state_loss = loss_fn(
             action_preds,  # a_hat_dist
             action_target,
             padding_mask,
             self.model.temperature().detach(),  # no gradient taken here
+            states_target,
+            state_preds
         )
         self.optimizer.zero_grad()
         loss.backward()
@@ -166,7 +146,9 @@ class SequenceTrainer:
             loss.detach().cpu().item(),
             nll.detach().cpu().item(),
             entropy.detach().cpu().item(),
-            rnd_loss
+            state_entropy,# .detach().cpu().item(),
+            state_loss,#.detach().cpu().item()
+            self.scheduler.get_last_lr()
         )
 
     def train_step_deter(self, loss_fn, trajs):
@@ -201,8 +183,15 @@ class SequenceTrainer:
             ordering,
             padding_mask=padding_mask,
         )
-        # noise = (torch.randn_like(action_target) * 0.2).clamp(-0.5, 0.5)
-        # action_target = action_target + noise.to(self.device)
+        
+        # noisy targets
+        # having twice the batch size, one batch of regular targets and one with noisy targets.
+        # ~> results showed that its different than just adding half the noise to the targets on one batch
+        noise = (torch.randn_like(action_target) * 0.1).clamp(-0.5, 0.5)
+        noisy_targets = action_target.clone().add(noise.to(self.device))
+        action_target = torch.concat([action_target, noisy_targets], dim=0)
+        action_preds = action_preds.repeat(2,1,1)
+        
         loss = loss_fn(action_preds, action_target)
 
         self.optimizer.zero_grad()
@@ -213,4 +202,4 @@ class SequenceTrainer:
         if self.scheduler is not None:
             self.scheduler.step()
 
-        return loss.detach().cpu().item()
+        return loss.detach().cpu().item(), self.scheduler.get_last_lr()

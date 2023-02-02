@@ -53,7 +53,6 @@ class TransformSamplingSubTraj:
         state_std,
         reward_scale,
         action_range,
-        use_rnd=False,
     ):
         super().__init__()
         self.max_len = max_len
@@ -62,7 +61,6 @@ class TransformSamplingSubTraj:
         self.state_mean = state_mean
         self.state_std = state_std
         self.reward_scale = reward_scale
-        self.use_rnd = use_rnd
 
         # For some datasets there are actions with values 1.0/-1.0 which is problematic
         # for the SquahsedNormal distribution. The inversed tanh transformation will
@@ -96,16 +94,6 @@ class TransformSamplingSubTraj:
         )
         if rtg.shape[0] <= tlen:
             rtg = np.concatenate([rtg, np.zeros((1, 1))])
-
-        if self.use_rnd:
-            intrinsic_rtg = discount_cumsum(traj["intrinsic_rewards"][si:], gamma=1.0)[: tlen + 1].reshape(
-                -1, 1
-            )
-            if intrinsic_rtg.shape[0] <= tlen:
-                intrinsic_rtg = np.concatenate([intrinsic_rtg, np.zeros((1, 1))])
-                
-            # scaling!?
-            rtg += 10*intrinsic_rtg
         
         # padding and state + reward normalization
         act_len = aa.shape[0]
@@ -114,6 +102,8 @@ class TransformSamplingSubTraj:
 
         ss = np.concatenate([np.zeros((self.max_len - tlen, self.state_dim)), ss])
         ss = (ss - self.state_mean) / self.state_std
+        # test symlog
+        # ss = np.sign(ss)*np.log(np.abs(ss) + 1)
 
         aa = np.concatenate([np.zeros((self.max_len - tlen, self.act_dim)), aa])
         rr = np.concatenate([np.zeros((self.max_len - tlen, 1)), rr])
@@ -149,10 +139,9 @@ def create_dataloader(
     state_std,
     reward_scale,
     action_range,
-    use_rnd=False,
     num_workers=24,
     sample_policy="length",
-):
+):  
     # total number of subt-rajectories you need to sample
     sample_size = batch_size * num_iters
     if sample_policy == "length":
@@ -170,7 +159,6 @@ def create_dataloader(
         state_std=state_std,
         reward_scale=reward_scale,
         action_range=action_range,
-        use_rnd=use_rnd,
     )
 
     subset = SubTrajectory(trajectories, sampling_ind=sampling_ind, transform=transform)
@@ -206,8 +194,24 @@ def sample_trajs_r(trajectories, sample_size):
 
     # sampling based on returns:
     returns = np.array([sum(traj["rewards"]) for traj in trajectories])
-    p_sample = (returns / np.sum(returns)).squeeze()
-
+    # Variant 1 - default very low to percentage (but highest) to best. very equally distributed. does only work for pos returns 
+    # p_sample = (returns / np.sum(returns)).squeeze()
+    
+    # Variant 2 - simple softmax (best gets very high percentage 0.99)
+    # torch_returns = torch.from_numpy(returns).float()
+    # p_sample = torch.softmax(torch_returns, dim=0).squeeze().numpy()
+    
+    # Variant 3 - normalize and then softmax. More distributed best ~20% 
+    norm_returns = (returns - np.mean(returns)) / (np.std(returns) + 1e-12)
+    p_sample = torch.softmax(torch.from_numpy(norm_returns).float(), dim=0).squeeze().numpy()
+        
+    # Variant 4 - different normalization. Seems better than Variant 1 as gives higher percentage to best but still very low 
+    # p_sample__ = (returns - returns.min()) / (returns - returns.min()).sum()
+    
+    # Varant 5 - softmax scaling by sqrt (len returns) --- best when many trajectories! > 500
+    # torch_returns = torch.from_numpy(returns).float()
+    # p_sample = torch.softmax(torch_returns / torch.sqrt(torch.FloatTensor([len(returns)])), dim=0).squeeze().numpy()
+    
     inds = np.random.choice(
         np.arange(len(trajectories)),
         size=sample_size,

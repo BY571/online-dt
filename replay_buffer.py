@@ -6,7 +6,7 @@ LICENSE.md file in the root directory of this source tree.
 """
 
 import numpy as np
-
+import torch
 
 class ReplayBuffer(object):
     def __init__(self, capacity, adding_type="ffo", trajectories=[]):
@@ -38,15 +38,32 @@ class ReplayBuffer(object):
         lengths = np.array([len(traj["rewards"]) for traj in self.trajectories])
         max_return, min_return, mean_return = np.max(returns), np.min(returns), np.mean(returns)
         max_traj_lenghts, min_traj_length, mean_traj_length = np.max(lengths), np.min(lengths), np.mean(lengths)
+        
+        norm_returns = (returns - np.mean(returns)) / (np.std(returns) + 1e-12)
+        p_sample = torch.softmax(torch.from_numpy(norm_returns).float(), dim=0).squeeze().numpy()
+        
+        # torch_returns = torch.from_numpy(returns).float()
+        # p_sample = torch.softmax(torch_returns, dim=0).squeeze().numpy()
+        
+        # torch_returns = torch.from_numpy(returns).float()
+        # p_sample = torch.softmax(torch_returns / torch.sqrt(torch.FloatTensor([len(returns)])), dim=0).squeeze().numpy()
+        
+        # p_sample = (returns / np.sum(returns)).squeeze()
+        
+        # when sampling for traj length
+        # traj_lens = np.array([len(traj["observations"]) for traj in self.trajectories])
+        # p_sample = traj_lens / np.sum(traj_lens)
+        
         output = {"buffer/max_return": max_return,
                   "buffer/min_return": min_return,
                   "buffer/mean_return": mean_return,
                   "buffer/max_traj_len": max_traj_lenghts,
                   "buffer/min_traj_len": min_traj_length,
-                  "buffer/mean_traj_len": mean_traj_length}
+                  "buffer/mean_traj_len": mean_traj_length,
+                  "buffer/p_sample": p_sample,}
         return output
 
-    def add_new_trajs(self, new_trajs):
+    def add_new_trajs(self, new_trajs, prefill=False):
         if len(self.trajectories) < self.capacity:
             self.trajectories.extend(new_trajs)
             self.trajectories = self.trajectories[-self.capacity :]

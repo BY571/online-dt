@@ -230,9 +230,7 @@ class Experiment:
                                        mode="normal",
                                        stochastic_policy=self.stochastic_policy,
                                        use_mean=True,
-                                       exploration_noise=0.0,
-                                       rnd_pred=None,
-                                       rnd_trgt=None,)
+                                       exploration_noise=0.0)
             
 
             env.close()
