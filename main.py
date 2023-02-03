@@ -79,6 +79,7 @@ class Experiment:
 
         self.stochastic_policy = variant["stochastic_policy"]
         self.exploration_noise = variant["exploration_noise"]
+        self.noise_sample_inter = variant["noise_sample_inter"]
         
 
         if not variant["use_cosineanneal"]:
@@ -297,6 +298,8 @@ class Experiment:
                 device=self.device,
                 stochastic_policy=self.stochastic_policy,
                 use_mean=use_mean,
+                exploration_noise=self.exploration_noise,
+                noise_sample_inter=self.noise_sample_inter,
             )
             output = {
                 "aug_traj/return": np.mean(returns),
@@ -333,7 +336,9 @@ class Experiment:
                 stochastic_policy=self.stochastic_policy,
                 use_mean=True,
                 exploration_noise=self.exploration_noise,
+                noise_sample_inter=self.noise_sample_inter,
                 reward_scale=self.reward_scale,
+                
             )
         ]
 
@@ -427,6 +432,7 @@ class Experiment:
                 stochastic_policy=self.stochastic_policy,
                 use_mean=True,
                 exploration_noise=self.exploration_noise,
+                noise_sample_inter=self.noise_sample_inter,
                 reward_scale=self.reward_scale,
             )
         ]
@@ -498,7 +504,7 @@ class Experiment:
                 eval_outputs, eval_reward = self.evaluate(eval_fns, evaluation_rtg)
                 outputs.update(eval_outputs)
                 outputs["evaluation/evaluation_rtg"] = evaluation_rtg
-            if self.pretrain_iter + self.online_iter % 1000 == 0:
+            if self.pretrain_iter + self.online_iter % 500 == 0:
                 self._save_model(
                     path_prefix=self.logger.log_path,
                     iteration=self.pretrain_iter + self.online_iter,
@@ -682,6 +688,8 @@ if __name__ == "__main__":
                         help="Sampling strategy from the replay buffer to get training examples. Sampling based on return or trajectory length")
     parser.add_argument("--best_x", type=int, default=5)
     parser.add_argument("--exploration_noise", type=float, default=0.125)
+    parser.add_argument("--noise_sample_inter", type=int, default=1,
+                        help="The step frequence of how often new noise for exploration should be sampled, default=1 ")
 
     # environment options
     parser.add_argument("--device", type=str, default="cuda")

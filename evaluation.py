@@ -24,6 +24,7 @@ def create_vec_eval_episodes_fn(
     use_mean=False,
     exploration_noise=0.1,
     reward_scale=0.001,
+    noise_sample_inter=1,
 ):
     def eval_episodes_fn(model, updated_rtg=None):
         if updated_rtg != None:
@@ -46,6 +47,7 @@ def create_vec_eval_episodes_fn(
             stochastic_policy=stochastic_policy,
             use_mean=use_mean,
             exploration_noise=exploration_noise,
+            noise_sample_inter=noise_sample_inter,
         )
         suffix = "_gm" if use_mean else ""
         return {
@@ -75,6 +77,7 @@ def vec_evaluate_episode_rtg(
     stochastic_policy=True,
     use_mean=False,
     exploration_noise=0.1,
+    noise_sample_inter=1,
 ):
     assert len(target_return) == vec_env.num_envs
 
@@ -146,7 +149,8 @@ def vec_evaluate_episode_rtg(
         if stochastic_policy:
             # the return action is a SquashNormal distribution
             action = action_dist.sample().reshape(num_envs, -1, act_dim)[:, -1]
-            noise = torch.normal(mean=torch.zeros_like(action), std=torch.ones_like(action) * action_range[1] * exploration_noise).to(action.device)
+            if t % noise_sample_inter == 0:
+                noise = torch.normal(mean=torch.zeros_like(action), std=torch.ones_like(action) * action_range[1] * exploration_noise).to(action.device)
             action = action + noise
             # added state sampling
             #state_pred = state_pred.sample().reshape(num_envs, -1, state_dim)[:, -1]
@@ -161,7 +165,8 @@ def vec_evaluate_episode_rtg(
         else:
             action = action_dist.reshape(num_envs, -1, act_dim)[:, -1]
             if not use_mean:
-                noise = torch.normal(mean=torch.zeros_like(action), std=torch.ones_like(action) * action_range[1] * exploration_noise).to(action.device)
+                if t % noise_sample_inter == 0:
+                    noise = torch.normal(mean=torch.zeros_like(action), std=torch.ones_like(action) * action_range[1] * exploration_noise).to(action.device)
                 action = action + noise
 
         action = action.clamp(*model.action_range)
