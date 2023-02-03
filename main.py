@@ -112,7 +112,7 @@ class Experiment:
             betas=[0.9, 0.999],
         )
 
-        self.best_x_buffer = variant["best_x"]      
+        self.buffer_size = variant["replay_size"]      
         # track the training progress and
         # training/evaluation/online performance in all the iterations
         self.pretrain_iter = 0
@@ -270,8 +270,9 @@ class Experiment:
         with torch.no_grad():
             # generate init state
             target_return = [target_explore * self.reward_scale] * online_envs.num_envs
-            mean_returns, std_returns, mean_traj_lens, min_return = self.replay_buffer.best_traj_stats(best_x=self.best_x_buffer)
+            mean_returns, std_returns, mean_traj_lens, min_return = self.replay_buffer.best_traj_stats(best_x=self.buffer_size)
             
+            # as default not using deter actions
             use_mean = False
             
             # adapt exploration exploitation:
@@ -309,6 +310,7 @@ class Experiment:
                 "buffer/running_mean_std": np.std(self.running_buffer_mean),
                 "aug_traj/use_mean_action": np.array([use_mean], dtype=float).item()}
 
+            # Add collected trajectory to replay buffer under condition
             #if lengths > mean_traj_lens:
             if returns > min_return:
                 self.replay_buffer.add_new_trajs(trajs)
@@ -422,7 +424,7 @@ class Experiment:
         eval_fns = [
             create_vec_eval_episodes_fn(
                 vec_env=eval_envs,
-                eval_rtg=evaluation_rtg, # TODO: I tink this is fixed make if flexible. thats why the eval_reward is broken
+                eval_rtg=evaluation_rtg, # TODO: I tink this is a fixed RTG make if flexible. thats why the eval_reward is broken
                 state_dim=self.state_dim,
                 act_dim=self.act_dim,
                 action_range=self.action_range,
@@ -681,13 +683,15 @@ if __name__ == "__main__":
     parser.add_argument("--num_updates_per_online_iter", type=int, default=25) # 300
     parser.add_argument("--eval_interval", type=int, default=50) # 10
     
+    # Buffer experience adding and sampling strategy
     # add to buffer when aug_return is bigger than x best mean returns
     parser.add_argument("--buffer_adding", type=str, choices=["ffo", "return", "traj_len"], default="return",
                         help="how to add new trajectories ffo=first_in_first_out, return=exchanges worst return trajectory with new traje, traj_len= exchanges shortest trajectory with new traj")
     parser.add_argument("--sample_policy", type=str, default="return", choices=["length", "return"],
                         help="Sampling strategy from the replay buffer to get training examples. Sampling based on return or trajectory length")
-    parser.add_argument("--best_x", type=int, default=5)
-    parser.add_argument("--exploration_noise", type=float, default=0.125)
+
+    # Exploration 
+    parser.add_argument("--exploration_noise", type=float, default=0.1)
     parser.add_argument("--noise_sample_inter", type=int, default=1,
                         help="The step frequence of how often new noise for exploration should be sampled, default=1 ")
 
