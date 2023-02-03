@@ -305,6 +305,7 @@ def random_collect(vec_env,
 @torch.no_grad()
 def video_evaluate_episode_rtg(
     env,
+    vid,
     state_dim,
     act_dim,
     action_range,
@@ -398,8 +399,7 @@ def video_evaluate_episode_rtg(
                 action = action + noise
 
         action = action.clamp(*model.action_range)
-        env.render(mode="human")# mode="human", width=256, height=256) #mode="rgb_array")
-        #print(t)
+        vid.capture_frame()
         state, reward, done, _ = env.step(action.detach().cpu().numpy())
 
         # eval_env.step() will execute the action for all the sub-envs, for those where
@@ -465,3 +465,4 @@ def video_evaluate_episode_rtg(
         episode_length.reshape(num_envs),
         trajectories,
     )
+    vid.close()

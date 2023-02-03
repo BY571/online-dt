@@ -1,4 +1,4 @@
-name: odt
+name: odt_new
 channels:
   - pytorch
 dependencies:
@@ -8,11 +8,11 @@ dependencies:
   - numpy
   - pip
   - pip:
-    - gym
+    - gym==0.18.3 # 0.21.0
     - git+https://github.com/rail-berkeley/d4rl@master#egg=d4rl
-    - mujoco==2.2.1
-    - numpy==1.20.3
-    - stable-baselines3==1.1.0
+    - mujoco==2.2.2
+    - numpy==1.22.4   #1.20.3
+    - stable-baselines3==1.6.2
     - tensorboard==2.5.0
     - torch==1.8.1
     - transformers==4.5.1

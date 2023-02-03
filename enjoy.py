@@ -12,9 +12,7 @@ import random
 import time
 import gym
 from gym.wrappers.monitoring.video_recorder import VideoRecorder
-from gym.wrappers import Monitor
-import d4rl
-from more_itertools import sample
+
 import torch
 import numpy as np
 import wandb
@@ -22,15 +20,16 @@ import wandb
 import utils
 
 from pathlib import Path
-from data import create_dataloader
+
+from main import get_offline_env
 from decision_transformer.models.decision_transformer import DecisionTransformer
 from evaluation import video_evaluate_episode_rtg
-from logger import WandbLogger
+
 
 MAX_EPISODE_LEN = 1000
 
 
-class Experiment:
+class Enjoy:
     def __init__(self, variant):
 
         self.state_dim, self.act_dim, self.action_range = self._get_env_spec(variant)
@@ -96,6 +95,7 @@ class Experiment:
 
     def _load_dataset(self, env_name):
 
+        env_name = get_offline_env(env_name)
         dataset_path = f"./data/{env_name}.pkl"
         with open(dataset_path, "rb") as f:
             trajectories = pickle.load(f)
@@ -134,66 +134,9 @@ class Experiment:
 
         return trajectories, state_mean, state_std
 
-
-    def evaluate(self, eval_fns, updated_r2g=None):
-        eval_start = time.time()
-        self.model.eval()
-        outputs = {}
-        for eval_fn in eval_fns:
-            o = eval_fn(self.model, updated_r2g)
-            outputs.update(o)
-        outputs["time/evaluation"] = time.time() - eval_start
-
-        eval_reward = outputs["evaluation/return_mean_gm"]
-        return outputs, eval_reward
-
     def __call__(self):
 
         utils.set_seed_everywhere(args.seed)
-
-        # import d4rl
-        if self.stochastic_policy:
-            def loss_fn(
-                a_hat_dist,
-                a,
-                attention_mask,
-                entropy_reg,
-            ):
-                # a_hat is a SquashedNormal Distribution
-                log_likelihood = a_hat_dist.log_likelihood(a)[attention_mask > 0].mean()
-
-                entropy = a_hat_dist.entropy().mean()
-                loss = -(log_likelihood + entropy_reg * entropy)
-
-                return (
-                    loss,
-                    -log_likelihood,
-                    entropy,
-                )
-        else:
-            loss_fn = lambda a_hat, a: torch.mean((a_hat - a)**2)
-
-        def get_env_builder(seed, env_name, target_goal=None):
-            def make_env_fn():
-                # import d4rl
-
-                env = gym.make(env_name)
-                env.seed(seed)
-                if hasattr(env.env, "wrapped_env"):
-                    env.env.wrapped_env.seed(seed)
-                elif hasattr(env.env, "seed"):
-                    env.env.seed(seed)
-                else:
-                    pass
-                env.action_space.seed(seed)
-                env.observation_space.seed(seed)
-
-                if target_goal:
-                    env.set_target_goal(target_goal)
-                    print(f"Set the target goal to be {env.target_goal}")
-                return env
-
-            return make_env_fn
 
         print("\n\nMaking Eval Env.....")
         env_name = self.variant["env"]
@@ -205,8 +148,9 @@ class Experiment:
         else:
             target_goal = None
 
-        env = gym.make(env_name)
-        env = Monitor(env, './dt-eval/video',video_callable=lambda episode_id: True, force=True)
+        env = gym.make(env_name, render_mode="rgb_array")
+        # env = Monitor(env, './dt-eval/video',video_callable=lambda episode_id: True, force=True)
+        vid = VideoRecorder(env, f'./dt-eval/video/{self.variant["exp_name"]}.mp4')
         self.start_time = time.time()
         with wandb.init(dir="./dt-eval",
                         config=self.variant,
@@ -217,6 +161,7 @@ class Experiment:
                         monitor_gym=True):
 
             video_evaluate_episode_rtg(env,
+                                       vid,
                                        state_dim=self.state_dim,
                                        act_dim=self.act_dim,
                                        action_range=self.action_range,
@@ -239,7 +184,7 @@ class Experiment:
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--seed", type=int, default=10)
-    parser.add_argument("--env", type=str, default="hopper-medium-v2")
+    parser.add_argument("--env", type=str, default="HalfCheetah-v3")
 
     # model options
     parser.add_argument("--K", type=int, default=20)
@@ -249,10 +194,11 @@ if __name__ == "__main__":
     parser.add_argument("--activation_function", type=str, default="relu")
     parser.add_argument("--dropout", type=float, default=0.1)
     parser.add_argument("--eval_context_length", type=int, default=5)
-    parser.add_argument("--stochastic_policy", type=int, choices=[0,1], default=1)
+    parser.add_argument("--stochastic_policy", type=int, choices=[0,1], default=0)
     # 0: no pos embedding others: absolute ordering
     parser.add_argument("--ordering", type=int, default=0)
 
+    parser.add_argument("--random_policy", type=int, default=0, choices=[0,1], help="")
     parser.add_argument("--model_path", type=str, default="saved_model")
 
     # environment options
@@ -262,7 +208,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     utils.set_seed_everywhere(args.seed)
-    experiment = Experiment(vars(args))
+    evaluation = Enjoy(vars(args))
 
     print("=" * 50)
-    experiment()
+    evaluation()
