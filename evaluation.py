@@ -13,7 +13,6 @@ MAX_EPISODE_LEN = 1000
 
 def create_vec_eval_episodes_fn(
     vec_env,
-    eval_rtg,
     state_dim,
     act_dim,
     action_range,
@@ -23,24 +22,16 @@ def create_vec_eval_episodes_fn(
     stochastic_policy=True,
     use_mean=False,
     exploration_noise=0.1,
-    reward_scale=0.001,
     noise_sample_inter=1,
 ):
-    def eval_episodes_fn(model, updated_rtg=None):
-        if updated_rtg != None:
-            target_return = [updated_rtg * reward_scale] * vec_env.num_envs
-        else:
-            target_return = [eval_rtg * reward_scale] * vec_env.num_envs
-        returns, lengths, _ = vec_evaluate_episode_rtg(
+    def eval_episodes_fn(model):
+        returns, lengths, _ = vec_evaluate_episode(
             vec_env,
             state_dim,
             act_dim,
             action_range,
             model,
             max_ep_len=MAX_EPISODE_LEN,
-            reward_scale=reward_scale,
-            target_return=target_return,
-            mode="normal",
             state_mean=state_mean,
             state_std=state_std,
             device=device,
@@ -49,37 +40,32 @@ def create_vec_eval_episodes_fn(
             exploration_noise=exploration_noise,
             noise_sample_inter=noise_sample_inter,
         )
-        suffix = "_gm" if use_mean else ""
         return {
-            f"evaluation/return_mean{suffix}": np.mean(returns),
-            f"evaluation/return_std{suffix}": np.std(returns),
-            f"evaluation/length_mean{suffix}": np.mean(lengths),
-            f"evaluation/length_std{suffix}": np.std(lengths),
+            f"evaluation/return_mean": np.mean(returns),
+            f"evaluation/return_std": np.std(returns),
+            f"evaluation/length_mean": np.mean(lengths),
+            f"evaluation/length_std": np.std(lengths),
         }
 
     return eval_episodes_fn
 
 
 @torch.no_grad()
-def vec_evaluate_episode_rtg(
+def vec_evaluate_episode(
     vec_env,
     state_dim,
     act_dim,
     action_range,
     model,
-    target_return: list,
     max_ep_len=1000,
-    reward_scale=0.001,
     state_mean=0.0,
     state_std=1.0,
     device="cuda",
-    mode="normal",
     stochastic_policy=True,
     use_mean=False,
-    exploration_noise=0.1,
+    exploration_noise=0.0,
     noise_sample_inter=1,
 ):
-    assert len(target_return) == vec_env.num_envs
 
     model.eval()
     model.to(device=device)
@@ -101,10 +87,6 @@ def vec_evaluate_episode_rtg(
     actions = torch.zeros(0, device=device, dtype=torch.float32)
     rewards = torch.zeros(0, device=device, dtype=torch.float32)
 
-    ep_return = target_return
-    target_return = torch.tensor(ep_return, device=device, dtype=torch.float32).reshape(
-        num_envs, -1, 1
-    )
     timesteps = torch.tensor([0] * num_envs, device=device, dtype=torch.long).reshape(
         num_envs, -1
     )
@@ -134,19 +116,20 @@ def vec_evaluate_episode_rtg(
         )
 
         state_pred, action_dist, reward_pred = model.get_predictions(
-            (states.to(dtype=torch.float32) - state_mean) / state_std,
-            # symlog
+            states=(states.to(dtype=torch.float32) - state_mean) / state_std,
             # torch.sign(states.to(dtype=torch.float32))*torch.log(torch.abs(states.to(dtype=torch.float32)) + 1),
-            actions.to(dtype=torch.float32),
-            rewards.to(dtype=torch.float32),
-            target_return.to(dtype=torch.float32),
-            timesteps.to(dtype=torch.long),
+            actions=actions.to(dtype=torch.float32),
+            rewards=torch.sign(rewards.to(dtype=torch.float32))*torch.log(torch.abs(rewards.to(dtype=torch.float32)) + 1), # rewards.to(dtype=torch.float32),
+            timesteps=timesteps.to(dtype=torch.long),
             num_envs=num_envs,
         )
         
-        state_pred = state_pred.detach().cpu().numpy().reshape(num_envs, -1)
-        reward_pred = reward_pred.detach().cpu().numpy().reshape(num_envs)
         if stochastic_policy:
+            # state reward predictions
+            state_pred = state_pred.sample().reshape(num_envs, -1, state_dim)[:, -1]
+            state_pred = state_pred.detach().cpu().numpy()
+            reward_pred = reward_pred.sample().reshape(num_envs, -1, 1)[:, -1]
+            reward_pred = reward_pred.detach().cpu().numpy().reshape(num_envs)
             # the return action is a SquashNormal distribution
             action = action_dist.sample().reshape(num_envs, -1, act_dim)[:, -1]
             if t % noise_sample_inter == 0:
@@ -163,6 +146,8 @@ def vec_evaluate_episode_rtg(
                 
             
         else:
+            state_pred = state_pred.detach().cpu().numpy().reshape(num_envs, -1)
+            reward_pred = reward_pred.detach().cpu().numpy().reshape(num_envs)
             action = action_dist.reshape(num_envs, -1, act_dim)[:, -1]
             if not use_mean:
                 if t % noise_sample_inter == 0:
@@ -187,14 +172,6 @@ def vec_evaluate_episode_rtg(
         reward = torch.from_numpy(reward).to(device=device).reshape(num_envs, 1)
         rewards[:, -1] = reward
 
-        if mode != "delayed":
-            pred_return = target_return[:, -1] - (reward * reward_scale)
-        else:
-            pred_return = target_return[:, -1]
-        target_return = torch.cat(
-            [target_return, pred_return.reshape(num_envs, -1, 1)], dim=1
-        )
-
         timesteps = torch.cat(
             [
                 timesteps,
@@ -218,8 +195,10 @@ def vec_evaluate_episode_rtg(
             break
 
     trajectories = []
+    ep_lengths = []
     for ii in range(num_envs):
         ep_len = episode_length[ii].astype(int)
+        ep_lengths.append(ep_len)
         terminals = np.zeros(ep_len)
         terminals[-1] = 1
         traj = {
@@ -232,9 +211,64 @@ def vec_evaluate_episode_rtg(
 
     return (
         episode_return.reshape(num_envs),
-        episode_length.reshape(num_envs),
+        ep_lengths,
         trajectories,
     )
+
+
+@torch.no_grad()
+def planned_augment(
+    vec_env,
+    planner,
+    max_ep_len=1000,
+):
+    # TODO: currently only supports single environment!
+    num_envs = vec_env.num_envs
+    state = vec_env.reset()
+
+    # episode_return, episode_length = 0.0, 0
+    episode_return = np.zeros((num_envs, 1)).astype(float)
+    episode_length = np.full(num_envs, np.inf)
+
+    unfinished = np.ones(num_envs).astype(bool)
+    states, actions, rewards, done_states = [], [], [], []
+    for t in range(max_ep_len):
+
+        action = planner.get_action(state)
+
+        next_state, reward, done, _ = vec_env.step(action)
+
+        states.append(state)
+        actions.append(action)
+        rewards.append(reward)
+        done_states.append(done)
+        
+        state = next_state
+        
+        if t == max_ep_len - 1:
+            done = np.ones(done.shape).astype(bool)
+
+        if np.any(done):
+            ind = np.where(done)[0]
+            unfinished[ind] = False
+            episode_length[ind] = np.minimum(episode_length[ind], t + 1)
+
+        if not np.any(unfinished):
+            break
+
+    traj = {
+        "observations": np.stack(states).squeeze(), # ugly squeeze
+        "actions": np.stack(actions).astype(dtype="float32"), # (1000, action_dim) float32
+        "rewards": np.stack(rewards).astype(dtype="float32"), # (1000, 1) float32 
+        "terminals": np.stack(done_states).astype(dtype=float).squeeze() # (1000, )
+    }
+    episode_return = np.sum(rewards, keepdims=True).reshape(-1)
+    return (
+        episode_return,
+        episode_length.reshape(num_envs),
+        [traj],
+    )
+
 
 def random_collect(vec_env,
                    state_dim,

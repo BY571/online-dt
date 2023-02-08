@@ -167,12 +167,13 @@ class DecisionTransformer(TrajectoryModel):
         hidden_size,
         action_range,
         ordering=0,
-        use_rtg=False,
+        use_reward=False,
         max_length=None,
         eval_context_length=None,
         max_ep_len=4096,
         action_tanh=True,
         stochastic_policy=False,
+        fixed_temperature=False,
         init_temperature=0.1,
         target_entropy=None,
         **kwargs
@@ -199,12 +200,11 @@ class DecisionTransformer(TrajectoryModel):
 
         self.embed_ln = nn.LayerNorm(hidden_size)
 
-        self.predict_state = torch.nn.Linear(hidden_size, self.state_dim)
-        # self.predict_state = DiagGaussianPred(hidden_size, self.state_dim)
-        
-        self.predict_return = torch.nn.Linear(hidden_size, 1)
+
         if stochastic_policy:
             self.predict_action = DiagGaussianActor(hidden_size, self.act_dim)
+            self.predict_state = DiagGaussianPred(hidden_size, self.state_dim)
+            self.predict_return = DiagGaussianPred(hidden_size, 1)
         else:
             self.predict_action = nn.Sequential(
                 *(
@@ -212,19 +212,22 @@ class DecisionTransformer(TrajectoryModel):
                     + ([nn.Tanh()] if action_tanh else [])
                 )
             )
+            self.predict_state = torch.nn.Linear(hidden_size, self.state_dim)               
+            self.predict_return = torch.nn.Linear(hidden_size, 1)
         self.stochastic_policy = stochastic_policy
         self.eval_context_length = eval_context_length
         self.ordering = ordering
         self.action_range = action_range
 
         self.log_temperature = torch.tensor(np.log(init_temperature))
-        self.log_temperature.requires_grad = True
+        if fixed_temperature:
+            self.log_temperature.requires_grad = True
         self.target_entropy = target_entropy
         
-        if use_rtg:
-            self.forward = self.forward_rtg
+        if use_reward:
+            self.forward = self.forward_full
         else:
-            self.forward = self.forward_nortg
+            self.forward = self.forward_action_state
 
 
     def temperature(self):
@@ -233,16 +236,18 @@ class DecisionTransformer(TrajectoryModel):
         else:
             return None
 
-    def forward_nortg(
+    def forward_action_state(
         self,
         states,
         actions,
         rewards,
-        returns_to_go,
         timesteps,
         ordering,
         padding_mask=None,
     ):
+        """
+        Forward pass if not include the reward 
+        """
 
         batch_size, seq_length = states.shape[0], states.shape[1]
 
@@ -253,7 +258,6 @@ class DecisionTransformer(TrajectoryModel):
         # embed each modality with a different head
         state_embeddings = self.embed_state(states)
         action_embeddings = self.embed_action(actions)
-        # returns_embeddings = self.embed_return(returns_to_go)
 
         if self.ordering:
             order_embeddings = self.embed_ordering(timesteps)
@@ -262,24 +266,23 @@ class DecisionTransformer(TrajectoryModel):
 
         state_embeddings = state_embeddings + order_embeddings
         action_embeddings = action_embeddings + order_embeddings
-        # returns_embeddings = returns_embeddings + order_embeddings
 
-        # this makes the sequence look like (R_1, s_1, a_1, R_2, s_2, a_2, ...)
+        # this makes the sequence look like (s_1, a_1, s_2, a_2, ...)
         # which works nice in an autoregressive sense since states predict actions
         stacked_inputs = (
             torch.stack(
-                (state_embeddings, action_embeddings), dim=1 # returns_embeddings
+                (state_embeddings, action_embeddings), dim=1
             )
             .permute(0, 2, 1, 3)
-            .reshape(batch_size, 2 * seq_length, self.hidden_size) # with RTG 3
+            .reshape(batch_size, 2 * seq_length, self.hidden_size)
         )
         stacked_inputs = self.embed_ln(stacked_inputs)
 
         # to make the attention mask fit the stacked inputs, have to stack it as well
         stacked_padding_mask = (
-            torch.stack((padding_mask, padding_mask), dim=1) # padding_mask
+            torch.stack((padding_mask, padding_mask), dim=1)
             .permute(0, 2, 1)
-            .reshape(batch_size, 2 * seq_length)  # with RTG 3
+            .reshape(batch_size, 2 * seq_length)
         )
 
         # we feed in the input embeddings (not word indices as in NLP) to the model
@@ -290,8 +293,8 @@ class DecisionTransformer(TrajectoryModel):
         x = transformer_outputs["last_hidden_state"]
 
         # reshape x so that the second dimension corresponds to the original
-        # returns (0), states (1), or actions (2); i.e. x[:,1,t] is the token for s_t
-        x = x.reshape(batch_size, seq_length, 2, self.hidden_size).permute(0, 2, 1, 3) # with RTG 3
+        # states (0), or actions (1); i.e. x[:,1,t] is the token for s_t
+        x = x.reshape(batch_size, seq_length, 2, self.hidden_size).permute(0, 2, 1, 3)
 
         # get predictions
         # predict next return given state and action
@@ -304,12 +307,11 @@ class DecisionTransformer(TrajectoryModel):
         return state_preds, action_preds, return_preds
 
 
-    def forward_rtg(
+    def forward_full(
         self,
         states,
         actions,
         rewards,
-        returns_to_go,
         timesteps,
         ordering,
         padding_mask=None,
@@ -324,7 +326,7 @@ class DecisionTransformer(TrajectoryModel):
         # embed each modality with a different head
         state_embeddings = self.embed_state(states)
         action_embeddings = self.embed_action(actions)
-        returns_embeddings = self.embed_return(returns_to_go)
+        returns_embeddings = self.embed_return(rewards)
 
         if self.ordering:
             order_embeddings = self.embed_ordering(timesteps)
@@ -339,18 +341,18 @@ class DecisionTransformer(TrajectoryModel):
         # which works nice in an autoregressive sense since states predict actions
         stacked_inputs = (
             torch.stack(
-                (returns_embeddings, state_embeddings, action_embeddings), dim=1 # returns_embeddings
+                (returns_embeddings, state_embeddings, action_embeddings), dim=1
             )
             .permute(0, 2, 1, 3)
-            .reshape(batch_size, 3 * seq_length, self.hidden_size) # with RTG 3
+            .reshape(batch_size, 3 * seq_length, self.hidden_size)
         )
         stacked_inputs = self.embed_ln(stacked_inputs)
 
         # to make the attention mask fit the stacked inputs, have to stack it as well
         stacked_padding_mask = (
-            torch.stack((padding_mask, padding_mask, padding_mask), dim=1) # padding_mask
+            torch.stack((padding_mask, padding_mask, padding_mask), dim=1)
             .permute(0, 2, 1)
-            .reshape(batch_size, 3 * seq_length)  # with RTG 3
+            .reshape(batch_size, 3 * seq_length)
         )
 
         # we feed in the input embeddings (not word indices as in NLP) to the model
@@ -362,7 +364,7 @@ class DecisionTransformer(TrajectoryModel):
 
         # reshape x so that the second dimension corresponds to the original
         # returns (0), states (1), or actions (2); i.e. x[:,1,t] is the token for s_t
-        x = x.reshape(batch_size, seq_length, 3, self.hidden_size).permute(0, 2, 1, 3) # with RTG 3
+        x = x.reshape(batch_size, seq_length, 3, self.hidden_size).permute(0, 2, 1, 3)
 
         # get predictions
         # predict next return given state and action
@@ -376,13 +378,13 @@ class DecisionTransformer(TrajectoryModel):
 
 
     def get_predictions(
-        self, states, actions, rewards, returns_to_go, timesteps, num_envs=1, **kwargs
+        self, states, actions, rewards, timesteps, num_envs=1, **kwargs
     ):
         # we don't care about the past rewards in this model
         # tensor shape: batch_size, seq_length, variable_dim
         states = states.reshape(num_envs, -1, self.state_dim)
         actions = actions.reshape(num_envs, -1, self.act_dim)
-        returns_to_go = returns_to_go.reshape(num_envs, -1, 1)
+        rewards = rewards.reshape(num_envs, -1, 1)
 
         # tensor shape: batch_size, seq_length
         timesteps = timesteps.reshape(num_envs, -1)
@@ -392,7 +394,7 @@ class DecisionTransformer(TrajectoryModel):
         if self.max_length is not None:
             states = states[:, -self.eval_context_length :]
             actions = actions[:, -self.eval_context_length :]
-            returns_to_go = returns_to_go[:, -self.eval_context_length :]
+            rewards = rewards[:, -self.eval_context_length :]
             timesteps = timesteps[:, -self.eval_context_length :]
 
             ordering = torch.tile(
@@ -439,17 +441,17 @@ class DecisionTransformer(TrajectoryModel):
                 ],
                 dim=1,
             ).to(dtype=torch.float32)
-            returns_to_go = torch.cat(
+            rewards = torch.cat(
                 [
                     torch.zeros(
                         (
-                            returns_to_go.shape[0],
-                            self.max_length - returns_to_go.shape[1],
+                            rewards.shape[0],
+                            self.max_length - rewards.shape[1],
                             1,
                         ),
-                        device=returns_to_go.device,
+                        device=rewards.device,
                     ),
-                    returns_to_go,
+                    rewards,
                 ],
                 dim=1,
             ).to(dtype=torch.float32)
@@ -481,15 +483,14 @@ class DecisionTransformer(TrajectoryModel):
         state_preds, action_preds, return_preds = self.forward(
             states,
             actions,
-            None,
-            returns_to_go,
+            rewards,
             timesteps,
             ordering,
             padding_mask=padding_mask,
             **kwargs
         )
         if self.stochastic_policy:
-            return state_preds[:, -1], action_preds, return_preds[:, -1] # state_preds[:, -1]
+            return state_preds, action_preds, return_preds
         else:
             return (
                 state_preds[:, -1],

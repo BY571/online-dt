@@ -15,10 +15,13 @@ from stable_baselines3.common.vec_env import SubprocVecEnv
 from pathlib import Path
 from data import create_dataloader
 from decision_transformer.models.decision_transformer import DecisionTransformer
-from evaluation import create_vec_eval_episodes_fn, vec_evaluate_episode_rtg, random_collect
+from evaluation import create_vec_eval_episodes_fn, vec_evaluate_episode, random_collect, planned_augment
 from trainer import SequenceTrainer
 from logger import WandbLogger
 from collections import deque
+from exploration.noise_decay import NoiseDecay
+from objectives import get_loss_function
+from utils import get_env_builder
 
 # try:
 #     import gym_cartpole_swingup
@@ -55,6 +58,11 @@ class Experiment:
 
         self.device = variant.get("device", "cuda")
         self.target_entropy = -self.act_dim
+        if variant["use_rtg"] or variant["plan_augment"]:
+            use_rtg = True
+        else:
+            use_rtg = False
+        
         self.model = DecisionTransformer(
             state_dim=self.state_dim,
             act_dim=self.act_dim,
@@ -72,14 +80,18 @@ class Experiment:
             attn_pdrop=variant["dropout"],
             stochastic_policy=variant["stochastic_policy"],
             ordering=variant["ordering"],
-            use_rtg=variant["use_rtg"],
+            use_rtg=use_rtg,
             init_temperature=variant["init_temperature"],
+            fixed_temperature=variant["fixed_temperature"],
             target_entropy=self.target_entropy,
         ).to(device=self.device)
-
+        print(self.model)
         self.stochastic_policy = variant["stochastic_policy"]
         self.exploration_noise = variant["exploration_noise"]
         self.noise_sample_inter = variant["noise_sample_inter"]
+        self.fixed_temperature = variant["fixed_temperature"]
+        
+        self.noise_decay = NoiseDecay(lin_decay_steps=2_000_000, start_noise=variant["exploration_noise"], end_noise=0.075)
         
 
         if not variant["use_cosineanneal"]:
@@ -123,7 +135,34 @@ class Experiment:
         self.logger = WandbLogger(variant)
         
         self.running_buffer_mean = deque(maxlen=10)
-        self.deter_iter = 0
+        
+        self.plan_augment = variant["plan_augment"]
+        if variant["plan_augment"]:
+            if variant["plan_type"] == "RS":
+                from planner.random_shooting import RandomShooting as RS
+                self.planner = RS(model=self.model,
+                                action_dim=self.act_dim,
+                                action_range=self.action_range,
+                                state_dim=self.state_dim,
+                                state_mean=self.state_mean,
+                                state_std=self.state_std,
+                                parallel_rollouts=variant["parallel_rollouts"],
+                                rollout_horizon=variant["rollout_horizon"],
+                                device=self.device)
+            elif variant["plan_type"] == "dream":
+                from planner.dt_policy_rollout import Dream
+                self.planner = Dream(
+                                model=self.model,
+                                action_dim=self.act_dim,
+                                action_range=self.action_range,
+                                state_dim=self.state_dim,
+                                state_mean=self.state_mean,
+                                state_std=self.state_std,
+                                parallel_rollouts=variant["parallel_rollouts"],
+                                rollout_horizon=variant["rollout_horizon"],
+                                device=self.device) 
+            else:
+                raise NotImplementedError
 
 
     def _get_online_stats(self, variant):
@@ -256,59 +295,58 @@ class Experiment:
     def _augment_trajectories(
         self,
         online_envs,
-        target_explore,
-        n,
-        randomized=False,
     ):
 
         max_ep_len = MAX_EPISODE_LEN
         returns = -np.inf
         lengths = 0
-        mean_returns = -np.inf
-        mean_traj_lens = 1
 
         with torch.no_grad():
             # generate init state
-            target_return = [target_explore * self.reward_scale] * online_envs.num_envs
             mean_returns, std_returns, mean_traj_lens, min_return = self.replay_buffer.best_traj_stats(best_x=self.buffer_size)
             
             # as default not using deter actions
             use_mean = False
-            
-            # adapt exploration exploitation:
-            self.running_buffer_mean.append(mean_returns)
-            # if np.std(self.running_buffer_mean) < 0.5:
-            #      use_mean = True
-            # if std_returns < 10:
-            #      use_mean = True
-            # if self.deter_iter % 10 == 0:
-            #      use_mean = True
-            
-            returns, lengths, trajs = vec_evaluate_episode_rtg(
-                online_envs,
-                self.state_dim,
-                self.act_dim,
-                self.action_range,
-                self.model,
-                max_ep_len=max_ep_len,
-                reward_scale=self.reward_scale,
-                target_return=target_return,
-                mode="normal",
-                state_mean=self.state_mean,
-                state_std=self.state_std,
-                device=self.device,
-                stochastic_policy=self.stochastic_policy,
-                use_mean=use_mean,
-                exploration_noise=self.exploration_noise,
-                noise_sample_inter=self.noise_sample_inter,
-            )
-            output = {
-                "aug_traj/return": np.mean(returns),
-                "aug_traj/max_return": np.max(returns),
-                "aug_traj/length": np.mean(lengths),
-                "buffer/size": self.replay_buffer.__len__(),
-                "buffer/running_mean_std": np.std(self.running_buffer_mean),
-                "aug_traj/use_mean_action": np.array([use_mean], dtype=float).item()}
+            if not self.plan_augment:
+                # exploration_noise = self.noise_decay.get_current_noise(self.total_transitions_sampled)
+                exploration_noise = self.exploration_noise
+                start_time = time.time()
+                returns, lengths, trajs = vec_evaluate_episode(
+                    online_envs,
+                    self.state_dim,
+                    self.act_dim,
+                    self.action_range,
+                    self.model,
+                    max_ep_len=max_ep_len,
+                    state_mean=self.state_mean,
+                    state_std=self.state_std,
+                    device=self.device,
+                    stochastic_policy=self.stochastic_policy,
+                    use_mean=use_mean,
+                    exploration_noise=exploration_noise,
+                    noise_sample_inter=self.noise_sample_inter,
+                )
+                data_collect_time = time.time() - start_time
+                output = {
+                    "aug_traj/collect_time": data_collect_time,
+                    "aug_traj/return": np.mean(returns),
+                    "aug_traj/exploration_noise": exploration_noise,
+                    "aug_traj/max_return": np.max(returns),
+                    "aug_traj/length": np.mean(lengths),
+                    "buffer/size": self.replay_buffer.__len__(),
+                    "aug_traj/use_mean_action": np.array([use_mean], dtype=float).item()}
+            else:
+                start_time = time.time()
+                returns, lengths, trajs = planned_augment(online_envs,
+                                                          planner=self.planner,
+                                                          max_ep_len=1000)
+                data_collect_time = time.time() - start_time
+                output = {
+                    "aug_traj/collect_time": data_collect_time,
+                    "aug_traj/return": np.mean(returns),
+                    "aug_traj/max_return": np.max(returns),
+                    "aug_traj/length": np.mean(lengths),
+                    "buffer/size": self.replay_buffer.__len__()}
 
             # Add collected trajectory to replay buffer under condition
             #if lengths > mean_traj_lens:
@@ -328,7 +366,6 @@ class Experiment:
         eval_fns = [
             create_vec_eval_episodes_fn(
                 vec_env=eval_envs,
-                eval_rtg=self.variant["eval_rtg"],
                 state_dim=self.state_dim,
                 act_dim=self.act_dim,
                 action_range=self.action_range,
@@ -338,9 +375,7 @@ class Experiment:
                 stochastic_policy=self.stochastic_policy,
                 use_mean=True,
                 exploration_noise=self.exploration_noise,
-                noise_sample_inter=self.noise_sample_inter,
-                reward_scale=self.reward_scale,
-                
+                noise_sample_inter=self.noise_sample_inter,               
             )
         ]
 
@@ -363,7 +398,6 @@ class Experiment:
                 act_dim=self.act_dim,
                 state_mean=self.state_mean,
                 state_std=self.state_std,
-                reward_scale=self.reward_scale,
                 action_range=self.action_range,
             )
 
@@ -390,41 +424,33 @@ class Experiment:
 
             self.pretrain_iter += 1
 
-    def evaluate(self, eval_fns, updated_r2g=None):
+    def evaluate(self, eval_fns):
         eval_start = time.time()
         self.model.eval()
         outputs = {}
         for eval_fn in eval_fns:
-            o = eval_fn(self.model, updated_r2g)
+            o = eval_fn(self.model)
             outputs.update(o)
         outputs["time/evaluation"] = time.time() - eval_start
 
-        eval_reward = outputs["evaluation/return_mean_gm"]
+        eval_reward = outputs["evaluation/return_mean"]
         return outputs, eval_reward
 
     def online_tuning(self, online_envs, eval_envs, loss_fn):
 
         print("\n\n\n*** Online Finetuning ***")
-
-
-        if self.variant["online_rtg_adaptation"]:
-            evaluation_rtg = 1.0
-            online_rtg = 1.0
-        else:
-            evaluation_rtg = self.variant["eval_rtg"]
-            online_rtg = self.variant["online_rtg"]
         
         trainer = SequenceTrainer(
             model=self.model,
             optimizer=self.optimizer,
             log_temperature_optimizer=self.log_temperature_optimizer,
+            fixed_temperature=self.fixed_temperature,
             scheduler=self.scheduler,
             device=self.device,
         )
         eval_fns = [
             create_vec_eval_episodes_fn(
                 vec_env=eval_envs,
-                eval_rtg=evaluation_rtg, # TODO: I tink this is a fixed RTG make if flexible. thats why the eval_reward is broken
                 state_dim=self.state_dim,
                 act_dim=self.act_dim,
                 action_range=self.action_range,
@@ -435,7 +461,6 @@ class Experiment:
                 use_mean=True,
                 exploration_noise=self.exploration_noise,
                 noise_sample_inter=self.noise_sample_inter,
-                reward_scale=self.reward_scale,
             )
         ]
         
@@ -443,35 +468,13 @@ class Experiment:
             print("\n*** Prefilling Replay Buffer! ***\n")
             for i in range(self.variant["prefill_trajectories"]):
                 self.prefill_buffer(online_envs=online_envs)
-                buffer_stats = self.replay_buffer.buffer_stats()
-
-                # Update best RTG
-                if buffer_stats["buffer/max_return"] > online_rtg:
-                    online_rtg = buffer_stats["buffer/max_return"] * 2
-                    evaluation_rtg = buffer_stats["buffer/max_return"]
                     
             print("\n*** Done Prefilling Replay Buffer! ***\n")
 
         while self.online_iter < self.variant["max_online_iters"] and self.total_transitions_sampled < self.variant["max_interactions"] :
-
+    
             outputs = {}
-            outputs["aug_traj/online_rtg"] = online_rtg
-            
-            self.deter_iter += 1
-            # collect new trajectory 
-            augment_outputs = self._augment_trajectories(
-                online_envs=online_envs,
-                target_explore=online_rtg,
-                n=self.variant["num_online_rollouts"],
-            )
-            outputs.update(augment_outputs)
-
-            # update online rtg if used 
-            if self.variant["online_rtg_adaptation"]:
-                if augment_outputs["aug_traj/max_return"] >= online_rtg:
-                    online_rtg = augment_outputs["aug_traj/max_return"] * 2
-                    evaluation_rtg = augment_outputs["aug_traj/max_return"]
-
+            # Train
             dataloader = create_dataloader(
                 trajectories=self.replay_buffer.trajectories,
                 num_iters=self.variant["num_updates_per_online_iter"],
@@ -481,12 +484,23 @@ class Experiment:
                 act_dim=self.act_dim,
                 state_mean=self.state_mean,
                 state_std=self.state_std,
-                reward_scale=self.reward_scale,
                 action_range=self.action_range,
                 sample_policy=self.variant["sample_policy"],
             )
+            train_outputs = trainer.train_iteration(
+                loss_fn=loss_fn,
+                dataloader=dataloader,
+            )
+            outputs.update(train_outputs)
+                        
+            # collect new trajectory 
+            augment_outputs = self._augment_trajectories(online_envs=online_envs)
+            outputs.update(augment_outputs)
 
-            # finetuning
+            # add buffer stats to logging
+            outputs.update(self.replay_buffer.buffer_stats())
+
+            # Evaluation
             is_last_iter = self.online_iter == self.variant["max_online_iters"] - 1
             if (self.online_iter + 1) % self.variant[
                 "eval_interval"
@@ -495,17 +509,11 @@ class Experiment:
             else:
                 evaluation = False
 
-            train_outputs = trainer.train_iteration(
-                loss_fn=loss_fn,
-                dataloader=dataloader,
-            )
-            outputs.update(train_outputs)
-            outputs.update(self.replay_buffer.buffer_stats())
-
             if evaluation:
-                eval_outputs, eval_reward = self.evaluate(eval_fns, evaluation_rtg)
+                eval_outputs, eval_reward = self.evaluate(eval_fns)
                 outputs.update(eval_outputs)
-                outputs["evaluation/evaluation_rtg"] = evaluation_rtg
+
+            # Save model
             if self.pretrain_iter + self.online_iter % 500 == 0:
                 self._save_model(
                     path_prefix=self.logger.log_path,
@@ -525,7 +533,6 @@ class Experiment:
 
             self.online_iter += 1
 
-
         self._save_model(
             path_prefix=self.logger.log_path,
             iteration=self.pretrain_iter + self.online_iter,
@@ -535,61 +542,9 @@ class Experiment:
     def __call__(self):
 
         utils.set_seed_everywhere(args.seed)
+        loss_fn = get_loss_function(self.stochastic_policy,
+                                    planning=self.plan_augment)
 
-        # import d4rl
-        if self.stochastic_policy:
-            def loss_fn(
-                a_hat_dist,
-                a,
-                attention_mask,
-                entropy_reg,
-                s,
-                s_hat,
-
-            ):
-                # a_hat is a SquashedNormal Distribution
-                log_likelihood = a_hat_dist.log_likelihood(a)[attention_mask > 0].mean()
-                entropy = a_hat_dist.entropy().mean()
-                
-                # state pred error
-                # state_loss = ((s_hat - s)**2).mean() # [attention_mask > 0]
-                # state_log_likelihood = s_hat.log_prob(s).sum(axis=2)[attention_mask > 0].mean()
-                # state_entropy = s_hat.entropy().mean()
-                state_entropy = 0
-                state_log_likelihood = 0
-                
-                loss = -(log_likelihood + entropy_reg * entropy)# + state_log_likelihood + entropy_reg * state_entropy)
-
-                return (
-                    loss,
-                    -log_likelihood,
-                    entropy,
-                    state_entropy,
-                    state_log_likelihood
-                )
-        else:
-            loss_fn = lambda a_hat, a: torch.mean((a_hat - a)**2)
-
-        def get_env_builder(seed, env_name, target_goal=None):
-            def make_env_fn():
-                print(f"*** Creating Environment: {env_name} ***")
-                env = gym.make(env_name)# , healthy_reward=0.75)
-                env.seed(seed)
-                if hasattr(env.env, "wrapped_env"):
-                    env.env.wrapped_env.seed(seed)
-                elif hasattr(env.env, "seed"):
-                    env.env.seed(seed)
-                else:
-                    pass
-                env.action_space.seed(seed)
-                env.observation_space.seed(seed)
-
-                if target_goal:
-                    env.set_target_goal(target_goal)
-                    print(f"Set the target goal to be {env.target_goal}")
-                return env
-
-            return make_env_fn
 
         print("\n\nMaking Eval Env.....")
         env_name = self.variant["env"]
@@ -623,7 +578,7 @@ class Experiment:
             online_envs = SubprocVecEnv(
                 [
                     get_env_builder(i + 100, env_name=env_name, target_goal=target_goal)
-                    for i in range(self.variant["num_online_rollouts"])
+                    for i in range(1)
                 ]
             )
             self.online_tuning(online_envs, eval_envs, loss_fn)
@@ -651,17 +606,18 @@ if __name__ == "__main__":
 
     # shared evaluation options
     parser.add_argument("--use_rtg", type=int, default=0)
-    parser.add_argument("--eval_rtg", type=int, default=6000)
+    # parser.add_argument("--eval_rtg", type=int, default=6000)
     parser.add_argument("--num_eval_episodes", type=int, default=5)
 
     # shared training options
-    parser.add_argument("--init_temperature", type=float, default=0.1)
+    parser.add_argument("--init_temperature", type=float, default=0.2) # 0.1
+    parser.add_argument("--fixed_temperature", type=int, default=1)
     parser.add_argument("--batch_size", type=int, default=256)
     parser.add_argument("--learning_rate", "-lr", type=float, default=1e-4)
     parser.add_argument("--weight_decay", "-wd", type=float, default=5e-4)
     # Learning rate scheduler
     parser.add_argument("--use_cosineanneal", type=int, default=1, choices=[0,1])
-    parser.add_argument("--warmup_steps", type=int, default=10000)    # 10000 for pure online we should probably decrease this ?!?
+    parser.add_argument("--warmup_steps", type=int, default=5)    # 10000 for pure online we should probably decrease this ?!?
     # Cosine Anneal Scheduler params
     parser.add_argument("--learning_rate_reset", type=float, default=1e-2)
     parser.add_argument("--lr_restart_updates", type=int, default=100, help="Number of updating steps until resetting the learning rate")
@@ -674,13 +630,11 @@ if __name__ == "__main__":
     # finetuning options
     parser.add_argument("--expert_experience", type=int, choices=[0,1], default=0)
     parser.add_argument("--prefill_trajectories", type=int, default=50)
-    parser.add_argument("--online_rtg_adaptation", type=int, choices=[0,1], default=0)
-    parser.add_argument("--max_online_iters", type=int, default=30000) # 1500
+    parser.add_argument("--max_online_iters", type=int, default=30000) # 1500  ####30000
     parser.add_argument("--max_interactions", type=int, default=10_000_000)
-    parser.add_argument("--online_rtg", type=int, default=12000)
-    parser.add_argument("--num_online_rollouts", type=int, default=1) # TODO: not used yet! always 1
+
     parser.add_argument("--replay_size", type=int, default=5)
-    parser.add_argument("--num_updates_per_online_iter", type=int, default=25) # 300
+    parser.add_argument("--num_updates_per_online_iter", type=int, default=15) # do tests to increase as now act, s and r prediction. original 300 with buffer size 1000
     parser.add_argument("--eval_interval", type=int, default=50) # 10
     
     # Buffer experience adding and sampling strategy
@@ -691,10 +645,18 @@ if __name__ == "__main__":
                         help="Sampling strategy from the replay buffer to get training examples. Sampling based on return or trajectory length")
 
     # Exploration 
-    parser.add_argument("--exploration_noise", type=float, default=0.1)
+    parser.add_argument("--exploration_noise", type=float, default=0.125)
     parser.add_argument("--noise_sample_inter", type=int, default=1,
                         help="The step frequence of how often new noise for exploration should be sampled, default=1 ")
 
+    # Planning
+    parser.add_argument("--plan_augment", type=int, default=0, help="Use planning for data collection")
+    parser.add_argument("--rollout_horizon", type=int, default=1, help="") # for MPC 30 was generally best in literature -test for DT
+    parser.add_argument("--parallel_rollouts", type=int, default=500)
+    # TODO: select RS or Internal planning
+    parser.add_argument("--plan_type", type=str, choices=["RS, dream"], default="dream",
+                        help="Type of planner RS (random shooting mpc), dream (use Decision Transformer policy to run multiple dreamed rollouts and take best action from the dream)")
+    
     # environment options
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--save_dir", type=str, default="./exp")

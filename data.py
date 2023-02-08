@@ -42,7 +42,7 @@ class SubTrajectory(torch.utils.data.Dataset):
     def __len__(self):
         return len(self.sampling_ind)
 
-
+# TODO: take off reward to go calculation
 class TransformSamplingSubTraj:
     def __init__(
         self,
@@ -137,8 +137,8 @@ def create_dataloader(
     act_dim,
     state_mean,
     state_std,
-    reward_scale,
     action_range,
+    reward_scale=0.001,
     num_workers=24,
     sample_policy="length",
 ):  

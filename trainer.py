@@ -15,12 +15,14 @@ class SequenceTrainer:
         model,
         optimizer,
         log_temperature_optimizer,
+        fixed_temperature=False,
         scheduler=None,
         device="cuda"
     ):
         self.model = model
         self.stochastic_policy = model.stochastic_policy
         self.optimizer = optimizer
+        self.fixed_temperature = fixed_temperature
         self.log_temperature_optimizer = log_temperature_optimizer
         self.scheduler = scheduler
         self.device = device
@@ -38,27 +40,27 @@ class SequenceTrainer:
         dataloader,
     ):
 
-        losses, nlls, entropies, state_losses, state_entropies = [], [], [], [], []
+        losses, nlls, state_losses, reward_losses = [], [], [], []
         logs = dict()
         train_start = time.time()
 
         self.model.train()
         for _, trajs in enumerate(dataloader):
-            loss, nll, entropy, state_entropy, state_loss, lr = self.train_step_stochastic(loss_fn, trajs)
+            loss, nll, entropy, state_entropy, state_loss, reward_entropy, reward_loss, lr = self.train_step_stochastic(loss_fn, trajs)
             losses.append(loss)
             nlls.append(nll)
-            entropies.append(entropy)
             state_losses.append(state_loss)
-            state_entropies.append(state_entropy)
-
+            reward_losses.append(reward_loss)
 
         logs["time/training"] = time.time() - train_start
         logs["training/train_loss_mean"] = np.mean(losses)
         logs["training/train_loss_std"] = np.std(losses)
         logs["training/nll"] = nlls[-1]
-        logs["training/entropy"] = entropies[-1]
-        logs["training/state_entropy"] = state_entropies[-1]
+        logs["training/entropy"] = entropy
+        logs["training/state_entropy"] = state_entropy
         logs["training/state_loss"] = np.mean(state_losses)
+        logs["training/reward_entropy"] = reward_entropy
+        logs["training/reward_loss"] = reward_loss
         logs["training/temp_value"] = self.model.temperature().detach().cpu().item()
         logs["training/current_lr"] = lr[-1]
 
@@ -69,16 +71,23 @@ class SequenceTrainer:
         loss_fn,
         dataloader
     ):
-        mse_loss = []
+        mse_loss, action_losses, state_losses, reward_losses = [], [], [], []
         logs = dict()
         train_start = time.time()
 
         for _, trajs in enumerate(dataloader):
-            loss, lr = self.train_step_deter(loss_fn, trajs)
+            loss, action_loss, state_loss, reward_loss, lr = self.train_step_deter(loss_fn, trajs)
             mse_loss.append(loss)
+            action_losses.append(action_loss)
+            state_losses.append(state_loss)
+            reward_losses.append(reward_loss)
+
         logs["time/training"] = time.time() - train_start
         logs["training/train_loss_mean"] = np.mean(mse_loss)
         logs["training/train_loss_std"] = np.std(mse_loss)
+        logs["training/action_loss"] = np.mean(action_losses)
+        logs["training/state_loss"] = np.mean(state_losses)
+        logs["training/reward_loss"] = np.mean(reward_losses)
         logs["training/current_lr"] = lr[-1]
         return logs
 
@@ -105,39 +114,39 @@ class SequenceTrainer:
         
         action_target = torch.clone(actions)
         states_target = torch.clone(states)
+        reward_target = torch.clone(rewards)
 
-        state_preds, action_preds, _ = self.model.forward(
+        state_preds, action_preds, reward_preds = self.model.forward(
             states,
             actions,
             rewards,
-            rtg[:, :-1],
             timesteps,
             ordering,
             padding_mask=padding_mask,
         )
 
-        #noise = (torch.randn_like(action_target) * 0.01).clamp(-0.05, 0.05)
-        #action_target = torch.tanh(action_target + noise.to(self.device))
-
-        loss, nll, entropy, state_entropy, state_loss = loss_fn(
+        loss, nll, entropy, state_entropy, state_loss, reward_entropy, reward_loss = loss_fn(
             action_preds,  # a_hat_dist
             action_target,
             padding_mask,
             self.model.temperature().detach(),  # no gradient taken here
             states_target,
-            state_preds
+            state_preds,
+            reward_target,
+            reward_preds
         )
         self.optimizer.zero_grad()
         loss.backward()
         torch.nn.utils.clip_grad_norm_(self.model.parameters(), 0.25)
         self.optimizer.step()
 
-        self.log_temperature_optimizer.zero_grad()
-        temperature_loss = (
-            self.model.temperature() * (entropy - self.model.target_entropy).detach()
-        )
-        temperature_loss.backward()
-        self.log_temperature_optimizer.step()
+        if not self.fixed_temperature:
+            self.log_temperature_optimizer.zero_grad()
+            temperature_loss = (
+                self.model.temperature() * (entropy - self.model.target_entropy).detach()
+            )
+            temperature_loss.backward()
+            self.log_temperature_optimizer.step()
 
         if self.scheduler is not None:
             self.scheduler.step()
@@ -146,8 +155,10 @@ class SequenceTrainer:
             loss.detach().cpu().item(),
             nll.detach().cpu().item(),
             entropy.detach().cpu().item(),
-            state_entropy,# .detach().cpu().item(),
-            state_loss,#.detach().cpu().item()
+            state_entropy.detach().cpu().item(),
+            state_loss.detach().cpu().item(),
+            reward_entropy.detach().cpu().item(),
+            reward_loss.detach().cpu().item(),
             self.scheduler.get_last_lr()
         )
 
@@ -172,13 +183,15 @@ class SequenceTrainer:
         ordering = ordering.to(self.device)
         padding_mask = padding_mask.to(self.device)        
         
+        # get target values
         action_target = torch.clone(actions)
+        state_target = torch.clone(states)
+        reward_target = torch.clone(rewards)
 
-        _, action_preds, _ = self.model.forward(
+        state_preds, action_preds, reward_pred = self.model.forward(
             states,
             actions,
             rewards,
-            rtg[:, :-1],
             timesteps,
             ordering,
             padding_mask=padding_mask,
@@ -187,12 +200,17 @@ class SequenceTrainer:
         # noisy targets
         # having twice the batch size, one batch of regular targets and one with noisy targets.
         # ~> results showed that its different than just adding half the noise to the targets on one batch
-        noise = (torch.randn_like(action_target) * 0.1).clamp(-0.5, 0.5)
-        noisy_targets = action_target.clone().add(noise.to(self.device))
-        action_target = torch.concat([action_target, noisy_targets], dim=0)
-        action_preds = action_preds.repeat(2,1,1)
+        noise = (torch.randn_like(action_target) * 0.125).clamp(-0.5, 0.5)
+        action_target = action_target.clone().add(noise.to(self.device))
+        # action_target = torch.concat([action_target, noisy_targets], dim=0)
+        # action_preds = action_preds.repeat(2,1,1)
         
-        loss = loss_fn(action_preds, action_target)
+        # TODO: test with state_target noise and reward_target noise
+        
+        loss, action_loss, state_loss, reward_loss = loss_fn(action_preds, action_target,
+                                                             state_preds, state_target,
+                                                             reward_pred, reward_target,
+                                                             padding_mask)
 
         self.optimizer.zero_grad()
         loss.backward()
@@ -202,4 +220,8 @@ class SequenceTrainer:
         if self.scheduler is not None:
             self.scheduler.step()
 
-        return loss.detach().cpu().item(), self.scheduler.get_last_lr()
+        return (loss.detach().cpu().item(),
+                action_loss.detach().cpu().item(),
+                state_loss.detach().cpu().item(),
+                reward_loss.detach().cpu().item(), 
+                self.scheduler.get_last_lr())
