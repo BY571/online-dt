@@ -34,6 +34,14 @@ class MPC():
     def get_action(self, state: torch.Tensor)-> torch.Tensor:
         raise NotImplementedError
     
+    def extract_best_action(self, traj: tuple):
+        states, actions, rewards = traj
+        # with shape (batch, time, feature)
+        returns = rewards.sum(1)
+        best_traj = torch.argmax(returns)
+        best_action = actions[best_traj, 0, :]
+        return best_action.cpu().numpy()
+    
     @torch.no_grad()
     def rollout(self, initial_state: np.array, action_candidates: torch.Tensor):
         self.model.eval()
@@ -113,16 +121,16 @@ class MPC():
             # if not np.any(unfinished):
             #     break
         
-        trajectories = []
-        for ii in range(self.parallel_rollouts):
-            # ep_len = episode_length[ii].astype(int)
-            # terminals = np.zeros(ep_len)
-            # terminals[-1] = 1
-            traj = {
-                "observations": states[ii].detach().cpu().numpy()[:self.rollout_horizon], # to get rid of possible last next state
-                "actions": actions[ii].detach().cpu().numpy()[:self.rollout_horizon],
-                "rewards": rewards[ii].detach().cpu().numpy()[:self.rollout_horizon],
-                # "terminals": terminals,
-            }
-            trajectories.append(traj)
-        return trajectories
+        # trajectories = []
+        # for ii in range(self.parallel_rollouts):
+        #     # ep_len = episode_length[ii].astype(int)
+        #     # terminals = np.zeros(ep_len)
+        #     # terminals[-1] = 1
+        #     traj = {
+        #         "observations": states[ii].detach().cpu().numpy()[:self.rollout_horizon], # to get rid of possible last next state
+        #         "actions": actions[ii].detach().cpu().numpy()[:self.rollout_horizon],
+        #         "rewards": rewards[ii].detach().cpu().numpy()[:self.rollout_horizon],
+        #         # "terminals": terminals,
+        #     }
+        #     trajectories.append(traj)
+        return (states, actions, rewards)

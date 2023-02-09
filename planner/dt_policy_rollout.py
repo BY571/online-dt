@@ -35,18 +35,9 @@ class Dream(MPC):
         # repeat on batch dimension for number of parallel rollouts
         initial_states = state.repeat(self.parallel_rollouts, axis=1)
         trajectories = self.rollout(initial_states)
-        best_traj_action = self.extract_best_trajectory(trajectories)
+        best_traj_action = self.extract_best_action(trajectories)
         return best_traj_action
-
-    def extract_best_trajectory(self, trajs: dict):
-        returns = []
-        for traj in trajs:
-            for k, v in traj.items():
-                if k == "rewards":
-                    returns.append(np.sum(v))
-        best_action_traj_idx = np.argmax(returns)
-        return trajs[best_action_traj_idx]["actions"][0]
-    
+            
     def sample_predictions(self, action_pred, state_pred, reward_pred):
         if self.stochastic_policy:
             # the return action is a SquashNormal distribution
@@ -68,11 +59,12 @@ class Dream(MPC):
         return action, state, reward
     
     
-    
+    # TODO: make this run all on torch GPU!
     @torch.no_grad()
     def rollout(self, initial_state: np.array):
         self.model.eval()
         self.model.to(device=self.device)
+        
         # we keep all the histories on the device
         # note that the latest action and reward will be "padding"
         states = (
@@ -88,8 +80,8 @@ class Dream(MPC):
                                  device=self.device,
                                  dtype=torch.long).reshape(self.parallel_rollouts, -1
         )
-        episode_length = np.full(self.parallel_rollouts, np.inf)
-        unfinished = np.ones(self.parallel_rollouts).astype(bool)      
+        #episode_length = np.full(self.parallel_rollouts, np.inf)
+        #unfinished = np.ones(self.parallel_rollouts).astype(bool)      
         for t in range(self.rollout_horizon):
 
             # add padding
@@ -117,7 +109,7 @@ class Dream(MPC):
                 timesteps=timesteps.to(dtype=torch.long),
                 num_envs=self.parallel_rollouts,
             )
-            # TODO: action sampling
+
             action, state, reward = self.sample_predictions(action_pred, state_pred, reward_pred)
 
             # Renormalize state and reward prediction
@@ -153,16 +145,4 @@ class Dream(MPC):
             # if not np.any(unfinished):
             #     break
         
-        trajectories = []
-        for ii in range(self.parallel_rollouts):
-            # ep_len = episode_length[ii].astype(int)
-            # terminals = np.zeros(ep_len)
-            # terminals[-1] = 1
-            traj = {
-                "observations": states[ii].detach().cpu().numpy()[:self.rollout_horizon], # to get rid of possible last next state
-                "actions": actions[ii].detach().cpu().numpy()[:self.rollout_horizon],
-                "rewards": rewards[ii].detach().cpu().numpy()[:self.rollout_horizon],
-                # "terminals": terminals,
-            }
-            trajectories.append(traj)
-        return trajectories
+        return (states, actions, rewards)

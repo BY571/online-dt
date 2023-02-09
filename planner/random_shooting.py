@@ -42,7 +42,7 @@ class RandomShooting(MPC):
         initial_states = state.repeat(self.parallel_rollouts, axis=1)
         rollout_action_candidates = self._sample_action()
         trajectories = self.rollout(initial_states, rollout_action_candidates)
-        best_traj_action = self.extract_best_trajectory(trajectories)
+        best_traj_action = self.extract_best_action(trajectories)
         return best_traj_action
 
     def extract_best_trajectory(self, trajs: dict):
