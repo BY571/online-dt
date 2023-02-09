@@ -123,35 +123,33 @@ class DiagGaussianActor(nn.Module):
         std = log_std.exp()
         return SquashedNormal(mu, std)
 
+class DensePredLearntSTD(nn.Module):
 
-class DiagGaussianPred(nn.Module):
-    """torch.distributions implementation of an diagonal Gaussian policy."""
-
-    def __init__(self, hidden_dim, act_dim, log_std_bounds=[-5.0, 2.0]):
+    def __init__(self, hidden_dim, out_dim, ):
         super().__init__()
 
-        self.mu = torch.nn.Linear(hidden_dim, act_dim)
-        self.log_std = torch.nn.Linear(hidden_dim, act_dim)
-        self.log_std_bounds = log_std_bounds
-
-        def weight_init(m):
-            """Custom weight init for Conv2D and Linear layers."""
-            if isinstance(m, torch.nn.Linear):
-                nn.init.orthogonal_(m.weight.data)
-                if hasattr(m.bias, "data"):
-                    m.bias.data.fill_(0.0)
-
-        self.apply(weight_init)
+        self.mu = torch.nn.Linear(hidden_dim, out_dim)
+        self.std = torch.nn.Linear(hidden_dim, out_dim)
+        self.softplus = nn.Softplus()
 
     def forward(self, obs):
-        mu, log_std = self.mu(obs), self.log_std(obs)
-        log_std = torch.tanh(log_std)
-        # log_std is the output of tanh so it will be between [-1, 1]
-        # map it to be between [log_std_min, log_std_max]
-        log_std_min, log_std_max = self.log_std_bounds
-        log_std = log_std_min + 0.5 * (log_std_max - log_std_min) * (log_std + 1.0)
-        std = log_std.exp()
+        mu, std = self.mu(obs), self.std(obs)
+        std = self.softplus(std) + 0.01
+
         return torch.distributions.Normal(mu, std)
+
+class DensePredFixedSTD(nn.Module):
+    """torch.distributions implementation of an diagonal Gaussian policy."""
+
+    def __init__(self, hidden_dim, out_dim, std=1.0):
+        super().__init__()
+        self.mu = torch.nn.Linear(hidden_dim, out_dim)
+        self._std = std
+
+
+    def forward(self, obs):
+        mu = self.mu(obs)
+        return torch.distributions.Normal(mu, self._std)
 
 
 class DecisionTransformer(TrajectoryModel):
@@ -203,8 +201,8 @@ class DecisionTransformer(TrajectoryModel):
 
         if stochastic_policy:
             self.predict_action = DiagGaussianActor(hidden_size, self.act_dim)
-            self.predict_state = DiagGaussianPred(hidden_size, self.state_dim)
-            self.predict_return = DiagGaussianPred(hidden_size, 1)
+            self.predict_state = DensePredLearntSTD(hidden_size, self.state_dim)
+            self.predict_return = DensePredFixedSTD(hidden_size, 1)
         else:
             self.predict_action = nn.Sequential(
                 *(
@@ -235,6 +233,11 @@ class DecisionTransformer(TrajectoryModel):
             return self.log_temperature.exp()
         else:
             return None
+
+    def reset_weights(self):
+        for layer in self.children():
+            if hasattr(layer, 'reset_parameters'):
+                layer.reset_parameters()
 
     def forward_action_state(
         self,
