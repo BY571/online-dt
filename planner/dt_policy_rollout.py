@@ -45,16 +45,12 @@ class Dream(MPC):
         best_traj_action = self.extract_best_action(trajectories)
         return best_traj_action
 
-    # TODO: optimize sampling take off not needed reshapes
     def sample_predictions(self, action_pred, state_pred, reward_pred):
         if self.stochastic_policy:
             # the return action is a SquashNormal distribution
-            action = action_pred.sample().reshape(self.parallel_rollouts, -1, self.action_dim)[:, -1]
-            state = state_pred.sample().reshape(self.parallel_rollouts, -1, self.state_dim)[:, -1]
-            state = state.reshape(self.parallel_rollouts, 1, self.state_dim)
-            reward = reward_pred.sample().reshape(self.parallel_rollouts, -1, 1)[:, -1]
-            # if use_mean:
-            #     action = action_dist.mean.reshape(num_envs, -1, act_dim)[:, -1] 
+            action = action_pred.sample[:, -1] # (batch, feature)
+            state = (state_pred.sample()[:, -1,:]).view(self.parallel_rollouts, 1, self.state_dim)
+            reward = reward_pred.sample()[:, -1] # (batch, 1)
         else:
             action = action_pred.reshape(self.parallel_rollouts, -1, self.action_dim)[:, -1]
             noise = torch.normal(mean=torch.zeros_like(action), std=torch.ones_like(action) * self.action_high * 0.125).to(action.device)
@@ -65,8 +61,6 @@ class Dream(MPC):
 
         action = action.clamp(self.action_low, self.action_high)
         return action, state, reward
-    
-    
 
     @torch.no_grad()
     def rollout(self, initial_state: np.array):
