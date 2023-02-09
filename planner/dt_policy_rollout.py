@@ -30,14 +30,22 @@ class Dream(MPC):
                                              reward_scale=reward_scale,
                                              device=device)
         self.stochastic_policy = model.stochastic_policy
-    
+
+        self.masked_actions = torch.zeros((self.parallel_rollouts, 1, self.action_dim),
+                                           device=self.device, dtype=torch.float32)
+        self.masked_rewards = torch.zeros((self.parallel_rollouts, 1, 1),
+                                           device=self.device, dtype=torch.float32)
+        self.timestep_adder = torch.ones((self.parallel_rollouts, 1),
+                                          device=self.device, dtype=torch.long)
+
     def get_action(self, state: np.array)-> torch.Tensor:
         # repeat on batch dimension for number of parallel rollouts
         initial_states = state.repeat(self.parallel_rollouts, axis=1)
         trajectories = self.rollout(initial_states)
         best_traj_action = self.extract_best_action(trajectories)
         return best_traj_action
-            
+
+    # TODO: optimize sampling take off not needed reshapes
     def sample_predictions(self, action_pred, state_pred, reward_pred):
         if self.stochastic_policy:
             # the return action is a SquashNormal distribution
@@ -59,7 +67,7 @@ class Dream(MPC):
         return action, state, reward
     
     
-    # TODO: make this run all on torch GPU!
+
     @torch.no_grad()
     def rollout(self, initial_state: np.array):
         self.model.eval()
@@ -67,46 +75,32 @@ class Dream(MPC):
         
         # we keep all the histories on the device
         # note that the latest action and reward will be "padding"
-        states = (
-            torch.from_numpy(initial_state)
-            .reshape(self.parallel_rollouts, self.state_dim)
-            .to(device=self.device, dtype=torch.float32)
-        ).reshape(self.parallel_rollouts, -1, self.state_dim) # (B, 1, F)
+        states = torch.from_numpy(initial_state).view(self.parallel_rollouts, 1, self.state_dim).to(device=self.device, dtype=torch.float32)
+         # (B, 1, F)
         
-        actions = torch.zeros(0, device=self.device, dtype=torch.float32)
+        actions = torch.zeros(0, device=self.device, dtype=torch.float32)       
         rewards = torch.zeros(0, device=self.device, dtype=torch.float32)
+
+        timesteps = torch.zeros((self.parallel_rollouts, 1),
+                                device=self.device,
+                                dtype=torch.long)
         
-        timesteps = torch.tensor([0] * self.parallel_rollouts,
-                                 device=self.device,
-                                 dtype=torch.long).reshape(self.parallel_rollouts, -1
-        )
         #episode_length = np.full(self.parallel_rollouts, np.inf)
         #unfinished = np.ones(self.parallel_rollouts).astype(bool)      
         for t in range(self.rollout_horizon):
 
             # add padding
-            actions = torch.cat(
-                [
-                    actions,
-                    torch.zeros((self.parallel_rollouts, self.action_dim), device=self.device).reshape(
-                        self.parallel_rollouts, -1, self.action_dim
-                    ),
-                ],
-                dim=1,
-            )
+            actions = torch.cat([actions, self.masked_actions], dim=1)
+            # (batch, t+1, feature)
             rewards = torch.cat(
-                [
-                    rewards,
-                    torch.zeros((self.parallel_rollouts, 1), device=self.device).reshape(self.parallel_rollouts, -1, 1),
-                ],
-                dim=1,
-            )
+                [rewards, self.masked_rewards],dim=1)
+            # (batch, t+1, feature)
 
             state_pred, action_pred, reward_pred = self.model.get_predictions(
-                states=(states.to(dtype=torch.float32) - self.state_mean) / self.state_std,
-                actions=actions.to(dtype=torch.float32),
-                rewards=torch.sign(rewards.to(dtype=torch.float32)) * torch.log(torch.abs(rewards.to(dtype=torch.float32)) + 1),
-                timesteps=timesteps.to(dtype=torch.long),
+                states=(states - self.state_mean) / self.state_std, # normalize
+                actions=actions,
+                rewards=torch.sign(rewards) * torch.log(torch.abs(rewards) + 1), # scale
+                timesteps=timesteps,
                 num_envs=self.parallel_rollouts,
             )
 
@@ -122,16 +116,7 @@ class Dream(MPC):
             rewards[:, -1] = renorm_reward
             actions[:, -1] = action
             
-            timesteps = torch.cat(
-                [
-                    timesteps,
-                    torch.ones((self.parallel_rollouts, 1), device=self.device, dtype=torch.long).reshape(
-                        self.parallel_rollouts, 1
-                    )
-                    * (t + 1),
-                ],
-                dim=1,
-            )
+            timesteps = torch.cat([timesteps, self.timestep_adder * (t + 1),], dim=1)
             
             # TODO: do we need terminal prediction?
             # if t == self.max_ep_len - 1:
