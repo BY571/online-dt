@@ -48,7 +48,7 @@ class Dream(MPC):
     def sample_predictions(self, action_pred, state_pred, reward_pred):
         if self.stochastic_policy:
             # the return action is a SquashNormal distribution
-            action = action_pred.sample[:, -1] # (batch, feature)
+            action = action_pred.sample()[:, -1] # (batch, feature)
             state = (state_pred.sample()[:, -1,:]).view(self.parallel_rollouts, 1, self.state_dim)
             reward = reward_pred.sample()[:, -1] # (batch, 1)
         else:
