@@ -130,10 +130,10 @@ class SequenceTrainer:
             action_target,
             padding_mask,
             self.model.temperature().detach(),  # no gradient taken here
-            states_target,
             state_preds,
-            reward_target,
-            reward_preds
+            states_target,
+            reward_preds,
+            reward_target
         )
         self.optimizer.zero_grad()
         loss.backward()

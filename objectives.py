@@ -72,16 +72,16 @@ def stoch_pred(
     reward_log_likelihood = r_hat_dist.log_prob(r_target).sum(axis=2)[attention_mask > 0].mean()
     reward_entropy = r_hat_dist.entropy().mean()
 
-    loss = -(log_likelihood + entropy_reg * entropy)# + state_log_likelihood + entropy_reg * state_entropy)
+    loss = -(log_likelihood + entropy_reg * entropy + state_log_likelihood + 0.0 * state_entropy + reward_log_likelihood + 0.0 * reward_entropy)
 
     return (
         loss,
         -log_likelihood,
         entropy,
         state_entropy,
-        state_log_likelihood,
+        -state_log_likelihood,
         reward_entropy,
-        reward_log_likelihood
+        -reward_log_likelihood
     )
 
 def deter_pred(a_hat, a, s_hat, s, r_hat, r, attention_mask):
