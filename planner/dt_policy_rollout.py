@@ -47,18 +47,25 @@ class Dream(MPC):
         best_action_traj_idx = np.argmax(returns)
         return trajs[best_action_traj_idx]["actions"][0]
     
-    def action_sample(self, action_pred):
+    def sample_predictions(self, action_pred, state_pred, reward_pred):
         if self.stochastic_policy:
             # the return action is a SquashNormal distribution
             action = action_pred.sample().reshape(self.parallel_rollouts, -1, self.action_dim)[:, -1]
+            state = state_pred.sample().reshape(self.parallel_rollouts, -1, self.state_dim)[:, -1]
+            state = state.reshape(self.parallel_rollouts, 1, self.state_dim)
+            reward = reward_pred.sample().reshape(self.parallel_rollouts, -1, 1)[:, -1]
             # if use_mean:
             #     action = action_dist.mean.reshape(num_envs, -1, act_dim)[:, -1] 
         else:
             action = action_pred.reshape(self.parallel_rollouts, -1, self.action_dim)[:, -1]
             noise = torch.normal(mean=torch.zeros_like(action), std=torch.ones_like(action) * self.action_high * 0.125).to(action.device)
             action = action + noise
+            
+            state = state_pred.detach().reshape(self.parallel_rollouts, 1, -1)
+            reward = reward_pred
+
         action = action.clamp(self.action_low, self.action_high)
-        return action
+        return action, state, reward
     
     
     
@@ -111,16 +118,16 @@ class Dream(MPC):
                 num_envs=self.parallel_rollouts,
             )
             # TODO: action sampling
-            action = self.action_sample(action_pred)
-            state_pred = state_pred.detach().reshape(self.parallel_rollouts, 1, -1)
+            action, state, reward = self.sample_predictions(action_pred, state_pred, reward_pred)
+
             # Renormalize state and reward prediction
-            renorm_state_pred = (state_pred * self.state_std) + self.state_mean
-            renorm_reward_pred = torch.sign(reward_pred) * (torch.exp(torch.abs(reward_pred)) - 1)
+            renorm_state = (state * self.state_std) + self.state_mean
+            renorm_reward = torch.sign(reward) * (torch.exp(torch.abs(reward)) - 1)
             
             # append predictions to rollout history
             # shapes [batch, time, feature]
-            states = torch.cat([states, renorm_state_pred], dim=1)
-            rewards[:, -1] = renorm_reward_pred
+            states = torch.cat([states, renorm_state], dim=1)
+            rewards[:, -1] = renorm_reward
             actions[:, -1] = action
             
             timesteps = torch.cat(
