@@ -36,8 +36,8 @@ def create_vec_eval_episodes_fn(
             state_std=state_std,
             device=device,
             stochastic_policy=stochastic_policy,
-            use_mean=use_mean,
-            exploration_noise=exploration_noise,
+            use_mean=True,
+            exploration_noise=0.0,
             noise_sample_inter=noise_sample_inter,
         )
         return {
@@ -79,17 +79,14 @@ def vec_evaluate_episode(
 
     # we keep all the histories on the device
     # note that the latest action and reward will be "padding"
-    states = (
-        torch.from_numpy(state)
-        .reshape(num_envs, state_dim)
-        .to(device=device, dtype=torch.float32)
-    ).reshape(num_envs, -1, state_dim)
+    states = torch.from_numpy(state).view(num_envs, 1, state_dim).to(device=device, dtype=torch.float32)
     actions = torch.zeros(0, device=device, dtype=torch.float32)
+    action_mask = torch.zeros((num_envs, 1, act_dim), device=device)
     rewards = torch.zeros(0, device=device, dtype=torch.float32)
+    reward_mask = torch.zeros((num_envs, 1, 1), device=device)
 
-    timesteps = torch.tensor([0] * num_envs, device=device, dtype=torch.long).reshape(
-        num_envs, -1
-    )
+    timesteps = torch.zeros((num_envs, 1), device=device, dtype=torch.long)
+    timestep_mask = torch.ones((num_envs, 1), device=device, dtype=torch.long)
 
     # episode_return, episode_length = 0.0, 0
     episode_return = np.zeros((num_envs, 1)).astype(float)
@@ -98,24 +95,10 @@ def vec_evaluate_episode(
     unfinished = np.ones(num_envs).astype(bool)
     for t in range(max_ep_len):
         # add padding
-        actions = torch.cat(
-            [
-                actions,
-                torch.zeros((num_envs, act_dim), device=device).reshape(
-                    num_envs, -1, act_dim
-                ),
-            ],
-            dim=1,
-        )
-        rewards = torch.cat(
-            [
-                rewards,
-                torch.zeros((num_envs, 1), device=device).reshape(num_envs, -1, 1),
-            ],
-            dim=1,
-        )
+        actions = torch.cat([actions, action_mask], dim=1)
+        rewards = torch.cat([rewards, reward_mask], dim=1)
 
-        state_pred, action_dist, reward_pred = model.get_predictions(
+        _, action_dist, _ = model.get_predictions(
             states=(states.to(dtype=torch.float32) - state_mean) / state_std,
             # torch.sign(states.to(dtype=torch.float32))*torch.log(torch.abs(states.to(dtype=torch.float32)) + 1),
             actions=actions.to(dtype=torch.float32),
@@ -126,15 +109,15 @@ def vec_evaluate_episode(
         
         if stochastic_policy:
             # state reward predictions
-            state_pred = state_pred.sample().reshape(num_envs, -1, state_dim)[:, -1]
-            state_pred = state_pred.detach().cpu().numpy()
-            reward_pred = reward_pred.sample().reshape(num_envs, -1, 1)[:, -1]
-            reward_pred = reward_pred.detach().cpu().numpy().reshape(num_envs)
+            # state_pred = state_pred.sample().reshape(num_envs, -1, state_dim)[:, -1]
+            # state_pred = state_pred.detach().cpu().numpy()
+            # reward_pred = reward_pred.sample().reshape(num_envs, -1, 1)[:, -1]
+            # reward_pred = reward_pred.detach().cpu().numpy().reshape(num_envs)
             # the return action is a SquashNormal distribution
             action = action_dist.sample().reshape(num_envs, -1, act_dim)[:, -1]
-            if t % noise_sample_inter == 0:
-                noise = torch.normal(mean=torch.zeros_like(action), std=torch.ones_like(action) * action_range[1] * exploration_noise).to(action.device)
-            action = action + noise
+            # if t % noise_sample_inter == 0:
+            #     noise = torch.normal(mean=torch.zeros_like(action), std=torch.ones_like(action) * action_range[1] * exploration_noise).to(action.device)
+            # action = action + noise
             # added state sampling
             #state_pred = state_pred.sample().reshape(num_envs, -1, state_dim)[:, -1]
             #
@@ -146,8 +129,8 @@ def vec_evaluate_episode(
                 
             
         else:
-            state_pred = state_pred.detach().cpu().numpy().reshape(num_envs, -1)
-            reward_pred = reward_pred.detach().cpu().numpy().reshape(num_envs)
+            # state_pred = state_pred.detach().cpu().numpy().reshape(num_envs, -1)
+            # reward_pred = reward_pred.detach().cpu().numpy().reshape(num_envs)
             action = action_dist.reshape(num_envs, -1, act_dim)[:, -1]
             if not use_mean:
                 if t % noise_sample_inter == 0:
@@ -172,16 +155,7 @@ def vec_evaluate_episode(
         reward = torch.from_numpy(reward).to(device=device).reshape(num_envs, 1)
         rewards[:, -1] = reward
 
-        timesteps = torch.cat(
-            [
-                timesteps,
-                torch.ones((num_envs, 1), device=device, dtype=torch.long).reshape(
-                    num_envs, 1
-                )
-                * (t + 1),
-            ],
-            dim=1,
-        )
+        timesteps = torch.cat([timesteps, timestep_mask * (t + 1)], dim=1)
 
         if t == max_ep_len - 1:
             done = np.ones(done.shape).astype(bool)
@@ -279,8 +253,9 @@ def random_collect(vec_env,
 
     states = (state.reshape(num_envs, state_dim)).reshape(num_envs, -1, state_dim)
     actions = np.zeros((num_envs, act_dim)).reshape(num_envs, -1, act_dim)
+    action_mask = np.zeros((num_envs, 1, act_dim))
     rewards = np.zeros((num_envs, 1)).reshape(num_envs, -1, 1)
-    
+    reward_mask = np.zeros((num_envs, 1)).reshape(num_envs, -1, 1)
     # episode_return, episode_length = 0.0, 0
     episode_return = np.zeros((num_envs, 1)).astype(float)
     episode_length = np.full(num_envs, np.inf)
@@ -288,13 +263,8 @@ def random_collect(vec_env,
     unfinished = np.ones(num_envs).astype(bool)
     for t in range(max_ep_len):
         # add padding
-        actions = np.concatenate([actions,
-                                  np.zeros((num_envs, act_dim)).reshape(num_envs, -1, act_dim),
-                                  ],axis=1,)
-        rewards = np.concatenate([rewards,
-                                  np.zeros((num_envs, 1)).reshape(num_envs, -1, 1),
-                                  ],
-                                  axis=1,)
+        actions = np.concatenate([actions, action_mask], axis=1)
+        rewards = np.concatenate([rewards, reward_mask], axis=1)
         action = vec_env.action_space.sample()
         state, reward, done, _ = vec_env.step(action)
         episode_return[unfinished] += reward[unfinished].reshape(-1, 1)
@@ -303,9 +273,7 @@ def random_collect(vec_env,
         states = np.concatenate([states, state], axis=1)
         reward = np.array(reward).reshape(num_envs, 1)
         rewards[:, -1] = reward
- 
-        
-        
+         
         if t == max_ep_len - 1:
             done = np.ones(done.shape).astype(bool)
 
