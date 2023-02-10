@@ -40,7 +40,7 @@ class Dream(MPC):
 
     def get_action(self, state: np.array)-> torch.Tensor:
         # repeat on batch dimension for number of parallel rollouts
-        initial_states = state.repeat(self.parallel_rollouts, axis=1)
+        initial_states = state.repeat(self.parallel_rollouts, axis=0) # MAKE SURE IS CORRECT
         trajectories = self.rollout(initial_states)
         best_traj_action = self.extract_best_action(trajectories)
         return best_traj_action
@@ -48,6 +48,7 @@ class Dream(MPC):
     def sample_predictions(self, action_pred, state_pred, reward_pred):
         if self.stochastic_policy:
             # the return action is a SquashNormal distribution
+            # Might want to add some small exploration noise as at some point the predictions become to similar
             action = action_pred.sample()[:, -1] # (batch, feature)
             state = (state_pred.sample()[:, -1,:]).view(self.parallel_rollouts, 1, self.state_dim)
             reward = reward_pred.sample()[:, -1] # (batch, 1)
@@ -75,9 +76,7 @@ class Dream(MPC):
         actions = torch.zeros(0, device=self.device, dtype=torch.float32)       
         rewards = torch.zeros(0, device=self.device, dtype=torch.float32)
 
-        timesteps = torch.zeros((self.parallel_rollouts, 1),
-                                device=self.device,
-                                dtype=torch.long)
+        timesteps = torch.zeros((self.parallel_rollouts, 1), device=self.device, dtype=torch.long)
         
         #episode_length = np.full(self.parallel_rollouts, np.inf)
         #unfinished = np.ones(self.parallel_rollouts).astype(bool)      
@@ -85,10 +84,10 @@ class Dream(MPC):
 
             # add padding
             actions = torch.cat([actions, self.masked_actions], dim=1)
-            # (batch, t+1, feature)
+            # (batch, t, feature)
             rewards = torch.cat(
                 [rewards, self.masked_rewards],dim=1)
-            # (batch, t+1, feature)
+            # (batch, t, feature)
 
             state_pred, action_pred, reward_pred = self.model.get_predictions(
                 states=(states - self.state_mean) / self.state_std, # normalize
