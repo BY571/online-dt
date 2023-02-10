@@ -107,6 +107,9 @@ class TransformSamplingSubTraj:
 
         aa = np.concatenate([np.zeros((self.max_len - tlen, self.act_dim)), aa])
         rr = np.concatenate([np.zeros((self.max_len - tlen, 1)), rr])
+        # symlog reward scaling
+        rr = np.sign(rr)*np.log(np.abs(rr) + 1)
+        
         dd = np.concatenate([np.ones((self.max_len - tlen)) * 2, dd])
         rtg = (
             np.concatenate([np.zeros((self.max_len - tlen, 1)), rtg])
