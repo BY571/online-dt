@@ -202,7 +202,7 @@ class DecisionTransformer(TrajectoryModel):
         if stochastic_policy:
             self.predict_action = DiagGaussianActor(hidden_size, self.act_dim)
             self.predict_state = DensePredLearntSTD(hidden_size, self.state_dim)
-            self.predict_return = DensePredFixedSTD(hidden_size, 1)
+            self.predict_return = DensePredLearntSTD(hidden_size, 1)
         else:
             self.predict_action = nn.Sequential(
                 *(
@@ -371,11 +371,11 @@ class DecisionTransformer(TrajectoryModel):
 
         # get predictions
         # predict next return given state and action
-        return_preds = self.predict_return(x[:, 1])
+        return_preds = self.predict_return(x[:, 2])
         # predict next state given state and action
-        state_preds = self.predict_state(x[:, 1])
+        state_preds = self.predict_state(x[:, 2])
         # predict next action given state
-        action_preds = self.predict_action(x[:, 0])
+        action_preds = self.predict_action(x[:, 1])
 
         return state_preds, action_preds, return_preds
 
