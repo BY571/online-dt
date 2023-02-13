@@ -80,7 +80,7 @@ class Experiment:
             attn_pdrop=variant["dropout"],
             stochastic_policy=variant["stochastic_policy"],
             ordering=variant["ordering"],
-            use_rtg=use_rtg,
+            use_reward=use_rtg,
             init_temperature=variant["init_temperature"],
             fixed_temperature=variant["fixed_temperature"],
             target_entropy=self.target_entropy,
@@ -459,8 +459,8 @@ class Experiment:
                 device=self.device,
                 stochastic_policy=self.stochastic_policy,
                 use_mean=True,
-                exploration_noise=self.exploration_noise,
-                noise_sample_inter=self.noise_sample_inter,
+                exploration_noise=0.0,
+                noise_sample_inter=1,
             )
         ]
         
@@ -487,6 +487,9 @@ class Experiment:
                 action_range=self.action_range,
                 sample_policy=self.variant["sample_policy"],
             )
+            # possible to reset the network for each training round
+            # to overcome overfitting 
+            # self.model.reset_weights()
             train_outputs = trainer.train_iteration(
                 loss_fn=loss_fn,
                 dataloader=dataloader,
@@ -514,7 +517,7 @@ class Experiment:
                 outputs.update(eval_outputs)
 
             # Save model
-            if self.pretrain_iter + self.online_iter % 500 == 0:
+            if self.pretrain_iter + self.online_iter % 100 == 0:
                 self._save_model(
                     path_prefix=self.logger.log_path,
                     iteration=self.pretrain_iter + self.online_iter,
@@ -610,7 +613,7 @@ if __name__ == "__main__":
     parser.add_argument("--num_eval_episodes", type=int, default=5)
 
     # shared training options
-    parser.add_argument("--init_temperature", type=float, default=0.2) # 0.1
+    parser.add_argument("--init_temperature", type=float, default=0.001) # 0.1
     parser.add_argument("--fixed_temperature", type=int, default=1)
     parser.add_argument("--batch_size", type=int, default=256)
     parser.add_argument("--learning_rate", "-lr", type=float, default=1e-4)
@@ -634,8 +637,8 @@ if __name__ == "__main__":
     parser.add_argument("--max_interactions", type=int, default=10_000_000)
 
     parser.add_argument("--replay_size", type=int, default=5)
-    parser.add_argument("--num_updates_per_online_iter", type=int, default=15) # do tests to increase as now act, s and r prediction. original 300 with buffer size 1000
-    parser.add_argument("--eval_interval", type=int, default=50) # 10
+    parser.add_argument("--num_updates_per_online_iter", type=int, default=25) # do tests to increase as now act, s and r prediction. original 300 with buffer size 1000
+    parser.add_argument("--eval_interval", type=int, default=10)
     
     # Buffer experience adding and sampling strategy
     # add to buffer when aug_return is bigger than x best mean returns
@@ -652,7 +655,7 @@ if __name__ == "__main__":
     # Planning
     parser.add_argument("--plan_augment", type=int, default=0, help="Use planning for data collection")
     parser.add_argument("--rollout_horizon", type=int, default=1, help="") # for MPC 30 was generally best in literature -test for DT
-    parser.add_argument("--parallel_rollouts", type=int, default=500)
+    parser.add_argument("--parallel_rollouts", type=int, default=250)
     # TODO: select RS or Internal planning
     parser.add_argument("--plan_type", type=str, choices=["RS, dream"], default="dream",
                         help="Type of planner RS (random shooting mpc), dream (use Decision Transformer policy to run multiple dreamed rollouts and take best action from the dream)")
@@ -664,7 +667,7 @@ if __name__ == "__main__":
     
     args = parser.parse_args()
 
-    utils.set_seed_everywhere(args.seed) # TODO: seeding seems to be off - env seed?
+    utils.set_seed_everywhere(args.seed) # TODO: seeding works on same machine! add 
     experiment = Experiment(vars(args))
 
     print("=" * 50)
